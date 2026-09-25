@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VPS SETUP SCRIPT v2.0
+#  VPS SETUP SCRIPT v2.1
 #  Ubuntu 24.04 LTS · Docker · NPM · 3x-ui · Hysteria2 · Telemt
 # =============================================================================
 set -euo pipefail
@@ -17,7 +17,6 @@ log_step()    { echo -e "\n${BOLD}${BLUE}═════════════
                 echo -e "${BOLD}${BLUE}  $*${NC}"
                 echo -e "${BOLD}${BLUE}══════════════════════════════════════════════${NC}\n"; }
 log_section() { echo -e "\n${BOLD}${CYAN}── $* ──${NC}\n"; }
-log_rollback(){ echo -e "\n${BOLD}${RED}[ОТКАТ]${NC} $*"; }
 
 die() { log_error "$*"; exit 1; }
 
@@ -32,28 +31,30 @@ save_state() { echo "$1" > "$STATE_FILE"; }
 get_state()  { [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || echo "0"; }
 
 # Сохраняем переменные между запусками
+# ВАЖНО: heredoc без кавычек вокруг метки (VARS) выполняет подстановку переменных —
+# это нужное поведение, но спецсимволы в паролях могут сломать heredoc.
+# Поэтому каждую переменную пишем через printf.
 save_vars() {
-  cat > "$VARS_FILE" << VARS
-NEW_USER="${NEW_USER}"
-USER_PASS="${USER_PASS}"
-LE_EMAIL="${LE_EMAIL}"
-ROOT_DOMAIN="${ROOT_DOMAIN}"
-NPM_DOMAIN="${NPM_DOMAIN}"
-XUI_DOMAIN="${XUI_DOMAIN}"
-H2_DOMAIN="${H2_DOMAIN}"
-SERVER_IP="${SERVER_IP}"
-XUI_PASS="${XUI_PASS}"
-H2_PASS="${H2_PASS}"
-TELEMT_SECRET="${TELEMT_SECRET}"
-SSH_PORT="${SSH_PORT}"
-XUI_PORT="${XUI_PORT}"
-P_VLESS_REALITY="${P_VLESS_REALITY}"
-P_VLESS_XHTTP="${P_VLESS_XHTTP}"
-P_TROJAN="${P_TROJAN}"
-P_SS="${P_SS}"
-P_H2="${P_H2}"
-P_TELEMT="${P_TELEMT}"
-VARS
+  {
+    printf 'NEW_USER=%q\n'         "${NEW_USER}"
+    printf 'USER_PASS=%q\n'        "${USER_PASS}"
+    printf 'LE_EMAIL=%q\n'         "${LE_EMAIL}"
+    printf 'ROOT_DOMAIN=%q\n'      "${ROOT_DOMAIN}"
+    printf 'NPM_DOMAIN=%q\n'       "${NPM_DOMAIN}"
+    printf 'XUI_DOMAIN=%q\n'       "${XUI_DOMAIN}"
+    printf 'H2_DOMAIN=%q\n'        "${H2_DOMAIN}"
+    printf 'SERVER_IP=%q\n'        "${SERVER_IP}"
+    printf 'H2_PASS=%q\n'          "${H2_PASS}"
+    printf 'TELEMT_SECRET=%q\n'    "${TELEMT_SECRET}"
+    printf 'SSH_PORT=%q\n'         "${SSH_PORT}"
+    printf 'XUI_PORT=%q\n'         "${XUI_PORT}"
+    printf 'P_VLESS_REALITY=%q\n'  "${P_VLESS_REALITY}"
+    printf 'P_VLESS_XHTTP=%q\n'    "${P_VLESS_XHTTP}"
+    printf 'P_TROJAN=%q\n'         "${P_TROJAN}"
+    printf 'P_SS=%q\n'             "${P_SS}"
+    printf 'P_H2=%q\n'             "${P_H2}"
+    printf 'P_TELEMT=%q\n'         "${P_TELEMT}"
+  } > "$VARS_FILE"
   chmod 600 "$VARS_FILE"
 }
 
@@ -105,7 +106,7 @@ wait_dns() {
   esac
 }
 
-# ─── Итог этапа и инструкция отката ─────────────────────────────────────────
+# ─── Итог этапа ──────────────────────────────────────────────────────────────
 stage_done() {
   local stage_num="$1"; local stage_name="$2"; local rollback_hint="$3"
   save_state "$stage_num"
@@ -125,7 +126,7 @@ stage_done() {
 CURRENT_STATE=$(get_state)
 
 echo -e "\n${BOLD}${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${BLUE}║           VPS SETUP SCRIPT v2.0                     ║${NC}"
+echo -e "${BOLD}${BLUE}║           VPS SETUP SCRIPT v2.1                     ║${NC}"
 echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════╝${NC}\n"
 
 if [[ "$CURRENT_STATE" != "0" ]]; then
@@ -248,18 +249,6 @@ SSH_PORT=${SSH_PORT:-3270}
 read -rp "$(echo -e "${BOLD}Порт панели 3x-ui (Enter = 2053):${NC} ")" XUI_PORT
 XUI_PORT=${XUI_PORT:-2053}
 
-# ── Пароль 3x-ui ─────────────────────────────────────────────────────────────
-echo ""
-log_section "Параметры 3x-ui"
-echo -e "${CYAN}Рекомендуем пароль 12+ символов.${NC}"
-while true; do
-  read -rsp "$(echo -e "${BOLD}Пароль для панели 3x-ui:${NC} ")" XUI_PASS; echo
-  [[ -z "$XUI_PASS" ]] && { log_warn "Пароль не может быть пустым"; continue; }
-  read -rsp "$(echo -e "${BOLD}Повтори пароль:${NC} ")" XUI_PASS2; echo
-  [[ "$XUI_PASS" == "$XUI_PASS2" ]] && break
-  log_warn "Пароли не совпадают"
-done
-
 # ── Автогенерация секретов ────────────────────────────────────────────────────
 H2_PASS=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 TELEMT_SECRET=$(openssl rand -hex 16)
@@ -306,26 +295,24 @@ read -rp "$(echo -e "${BOLD}${RED}Всё верно? Продолжить? (yes/
 save_vars
 
 # ── Обновление системы ────────────────────────────────────────────────────────
-log_section "Обновление системы"
-log_info "Обновляем пакеты — это может занять несколько минут..."
+log_section "Обновление системы (фоновый процесс)"
+log_info "Запускаем обновление пакетов в фоне, пока скрипт продолжает работу..."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get upgrade -y -o Dpkg::Options::="--force-confold" -qq
-apt-get autoremove -y -qq
-log_ok "Система обновлена"
+apt-get upgrade -y -o Dpkg::Options::="--force-confold" -qq &
+APT_UPGRADE_PID=$!
+log_info "Обновление запущено (PID: ${APT_UPGRADE_PID}). Продолжаем настройку..."
 
-# ── Установка базовых утилит ──────────────────────────────────────────────────
-log_info "Устанавливаем базовые утилиты..."
+# Ставим нужные утилиты, не ожидая полного апгрейда
 apt-get install -y -o Dpkg::Options::="--force-confold" -qq \
   curl wget git htop net-tools ufw fail2ban unzip \
-  python3 openssl unattended-upgrades apt-listchanges dnsutils sqlite3
-log_ok "Утилиты установлены"
+  python3 openssl unattended-upgrades apt-listchanges dnsutils
 
 # Автообновления безопасности
 dpkg-reconfigure -plow unattended-upgrades <<< $'\n' 2>/dev/null || true
 
-stage_done 0 "Сбор данных + обновление системы" \
+stage_done 0 "Сбор данных + запуск обновления" \
   "rm -f /root/.vps-setup-state /root/.vps-setup-vars — сбросит прогресс"
 
 fi  # END STAGE 0
@@ -430,8 +417,7 @@ fi
 
 grep -q "vm.swappiness=10" /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
 sysctl -p > /dev/null
-free -h | grep -q "1.0G\|1024M\|Gi" && log_ok "Swap активен" || \
-  { free -h; log_warn "Проверь swap выше"; }
+free -h
 
 # ── 1.5 Часовой пояс ─────────────────────────────────────────────────────────
 timedatectl set-timezone Europe/Moscow
@@ -457,7 +443,7 @@ ufw allow "${P_H2}/udp"               comment 'Hysteria2'
 ufw allow "${P_TELEMT}/tcp"           comment 'Telemt MTProxy'
 
 ufw --force enable > /dev/null
-ufw status | grep -q "Status: active" && log_ok "UFW активен" || log_warn "UFW не активен!"
+ufw status verbose
 
 # ── 1.7 Fail2Ban ─────────────────────────────────────────────────────────────
 log_section "1.6 — Fail2Ban"
@@ -479,6 +465,14 @@ systemctl restart fail2ban
 sleep 2
 fail2ban-client ping 2>/dev/null | grep -q "pong" && log_ok "Fail2Ban работает" || \
   log_warn "Fail2Ban не отвечает — проверь: journalctl -u fail2ban"
+
+# Ждём завершения фонового apt-get upgrade
+if [[ -n "${APT_UPGRADE_PID:-}" ]] && kill -0 "$APT_UPGRADE_PID" 2>/dev/null; then
+  log_info "Ожидаем завершения обновления системы..."
+  wait "$APT_UPGRADE_PID" && log_ok "Обновление системы завершено" || \
+    log_warn "Обновление завершилось с ошибками — проверь вручную"
+fi
+apt-get autoremove -y -qq
 
 stage_done 1 "Пользователь, SSH, Swap, UFW, Fail2Ban" \
   "SSH откат: cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config && systemctl restart ssh
@@ -508,7 +502,7 @@ usermod -aG docker "$NEW_USER"
 systemctl enable docker > /dev/null 2>&1
 systemctl start docker
 docker version --format 'Server: {{.Server.Version}}' 2>/dev/null && log_ok "Docker запущен" || \
-  log_warn "Docker не запустился!"
+  die "Docker не запустился!"
 
 # ── 2.2 Лимиты логов ─────────────────────────────────────────────────────────
 log_section "2.2 — Лимиты логов Docker"
@@ -598,7 +592,7 @@ EOF
 
 cd /opt/docker/nginx-proxy-manager
 
-if docker ps --format '{{.Names}}' | grep -q nginx-proxy-manager; then
+if docker ps --format '{{.Names}}' | grep -q "^nginx-proxy-manager$"; then
   log_warn "NPM уже запущен — перезапускаю"
   docker compose down
 fi
@@ -607,8 +601,9 @@ docker compose up -d
 log_info "Ждём инициализации NPM (25 секунд)..."
 sleep 25
 
-docker ps --format '{{.Names}} {{.Status}}' | grep nginx-proxy-manager | \
-  grep -q "Up" && log_ok "NPM запущен" || log_warn "NPM не запустился — смотри: docker logs nginx-proxy-manager"
+docker ps --format '{{.Names}} {{.Status}}' | grep "nginx-proxy-manager" | \
+  grep -q "Up" && log_ok "NPM запущен" || \
+  die "NPM не запустился — смотри: docker logs nginx-proxy-manager"
 
 echo ""
 echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════╗${NC}"
@@ -641,7 +636,12 @@ sed -i 's|- "81:81"|- "127.0.0.1:81:81"|' \
 
 cd /opt/docker/nginx-proxy-manager
 docker compose down && docker compose up -d
+log_info "Ждём перезапуска NPM (15 секунд)..."
 sleep 15
+
+docker ps --format '{{.Names}} {{.Status}}' | grep "nginx-proxy-manager" | \
+  grep -q "Up" && log_ok "NPM перезапущен" || \
+  log_warn "NPM не запустился после перезапуска — проверь: docker logs nginx-proxy-manager"
 
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://${NPM_DOMAIN}" 2>/dev/null || echo "000")
 if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
@@ -734,13 +734,13 @@ networks:
 EOF
 
 cd /opt/docker/nginx-site
-if docker ps --format '{{.Names}}' | grep -q nginx-site; then
+if docker ps --format '{{.Names}}' | grep -q "^nginx-site$"; then
   docker compose down
 fi
 docker compose up -d
 sleep 5
 
-docker ps --format '{{.Names}} {{.Status}}' | grep nginx-site | grep -q "Up" && \
+docker ps --format '{{.Names}} {{.Status}}' | grep "nginx-site" | grep -q "Up" && \
   log_ok "nginx-site запущен" || log_warn "nginx-site не запустился"
 
 echo ""
@@ -810,135 +810,93 @@ fi
 
 docker compose pull
 docker compose up -d
-log_info "Ждём 20 секунд..."
+log_info "Ждём запуска 3x-ui (20 секунд)..."
 sleep 20
 
 docker ps --format '{{.Names}} {{.Status}}' | grep "3x-ui" | grep -q "Up" && \
   log_ok "3x-ui запущен" || log_warn "3x-ui не запустился — см. docker logs 3x-ui"
 
-# ── Смена пароля через SQLite ─────────────────────────────────────────────────
-log_section "5.1 — Смена пароля 3x-ui через SQLite"
-
-log_info "Метод: прямая запись в БД SQLite (работает в версиях 3.x)"
-log_info "Файл БД: /opt/docker/3x-ui/db/x-ui.db"
-
-# Хэшируем пароль так же как это делает 3x-ui (MD5 для совместимости)
-# 3x-ui >= 2.3 хранит пароли в открытом виде в таблице settings
-XUI_PASS_ESCAPED=$(printf '%s' "$XUI_PASS" | sed "s/'/''/g")
-NEW_USER_ESCAPED=$(printf '%s' "$NEW_USER" | sed "s/'/''/g")
-
-# Ждём появления БД (она создаётся при первом запуске)
-DB_PATH="/opt/docker/3x-ui/db/x-ui.db"
-for i in $(seq 1 10); do
-  [[ -f "$DB_PATH" ]] && break
-  log_info "Ждём создания БД (${i}/10)..."
-  sleep 3
-done
-
-if [[ -f "$DB_PATH" ]]; then
-  # Устанавливаем sqlite3 если нет
-  command -v sqlite3 &>/dev/null || apt-get install -y -qq sqlite3
-
-  # Проверяем структуру таблицы
-  TABLES=$(sqlite3 "$DB_PATH" ".tables" 2>/dev/null || echo "")
-  log_info "Таблицы в БД: ${TABLES}"
-
-  if echo "$TABLES" | grep -q "settings"; then
-    # Меняем через таблицу settings
-    sqlite3 "$DB_PATH" "UPDATE settings SET value='${NEW_USER_ESCAPED}' WHERE key='webUsername';" 2>/dev/null || true
-    sqlite3 "$DB_PATH" "UPDATE settings SET value='${XUI_PASS_ESCAPED}' WHERE key='webPassword';" 2>/dev/null || true
-
-    # Проверяем результат
-    SAVED_USER=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='webUsername';" 2>/dev/null || echo "?")
-    log_info "Сохранённый логин в БД: ${SAVED_USER}"
-
-    if [[ "$SAVED_USER" == "$NEW_USER" ]]; then
-      log_ok "Логин/пароль записаны в БД"
-      docker restart 3x-ui
-      sleep 15
-      log_ok "3x-ui перезапущен с новыми учётными данными"
-    else
-      log_warn "Таблица settings не содержит webUsername — попробуем users"
-    fi
-  fi
-
-  if echo "$TABLES" | grep -q "users"; then
-    sqlite3 "$DB_PATH" "UPDATE users SET username='${NEW_USER_ESCAPED}', password='${XUI_PASS_ESCAPED}' WHERE id=1;" 2>/dev/null || true
-    docker restart 3x-ui
-    sleep 15
-    log_ok "Логин/пароль обновлены через таблицу users"
-  fi
-else
-  log_warn "БД не найдена по пути ${DB_PATH}"
-fi
-
-# ── Инструкция ручной смены ───────────────────────────────────────────────────
+# ── Proxy Host в NPM + сертификат для панели ─────────────────────────────────
 echo ""
-echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${YELLOW}║  КАК ВРУЧНУЮ ПОМЕНЯТЬ ЛОГИН/ПАРОЛЬ 3x-ui (v3.x)           ║${NC}"
-echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Способ 1 — через панель (если вошёл как admin/admin):"
-echo -e "${BOLD}${YELLOW}║${NC}  Settings → Panel Settings → Username / Password → Save"
+echo -e "${BOLD}${YELLOW}╔════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${YELLOW}║  ДЕЙСТВИЯ В NPM — 3x-ui                                       ║${NC}"
+echo -e "${BOLD}${YELLOW}╠════════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Способ 2 — через SQLite напрямую:"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}docker stop 3x-ui${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}apt-get install -y sqlite3${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}sqlite3 /opt/docker/3x-ui/db/x-ui.db${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Внутри sqlite3 — посмотреть таблицы:"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}.tables${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Посмотреть текущие настройки:"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}SELECT * FROM settings WHERE key LIKE '%web%';${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Изменить логин и пароль:"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}UPDATE settings SET value='ВАШ_ЛОГИН' WHERE key='webUsername';${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}UPDATE settings SET value='ВАШ_ПАРОЛЬ' WHERE key='webPassword';${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}.quit${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}docker start 3x-ui${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Способ 3 — если таблица users:"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}UPDATE users SET username='ВАШ_ЛОГИН', password='ВАШ_ПАРОЛЬ' WHERE id=1;${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Проверить какие таблицы есть:"
-echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}sqlite3 /opt/docker/3x-ui/db/x-ui.db '.tables'${NC}"
-echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
-
-# ── Proxy Host в NPM ─────────────────────────────────────────────────────────
-echo ""
-echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${YELLOW}║  ДЕЙСТВИЯ В NPM — 3x-ui + НАСТРОЙКА INBOUNDS               ║${NC}"
-echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Add Proxy Host:"
+echo -e "${BOLD}${YELLOW}║${NC}  Шаг 1 — Add Proxy Host:"
 echo -e "${BOLD}${YELLOW}║${NC}    Domain Names:     ${CYAN}${XUI_DOMAIN}${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}    Forward Hostname: ${GREEN}3x-ui${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}    Forward Port:     ${GREEN}${XUI_PORT}${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}    Websockets: ✔ | Block Common Exploits: ✔"
-echo -e "${BOLD}${YELLOW}║${NC}    SSL: Let's Encrypt + Force SSL + HTTP/2"
+echo -e "${BOLD}${YELLOW}║${NC}    SSL → Let's Encrypt + Force SSL + HTTP/2"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Панель: ${CYAN}https://${XUI_DOMAIN}${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  Логин:  ${GREEN}${NEW_USER}${NC}   Пароль: ${GREEN}${XUI_PASS}${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  (если не вошёл — используй способ 2 выше)"
+echo -e "${BOLD}${YELLOW}║${NC}  Шаг 2 — Зайди в панель по адресу:"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}https://${XUI_DOMAIN}${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Логин по умолчанию: ${GREEN}admin / admin${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║  INBOUNDS (Inbounds → Add Inbound):                         ║${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Шаг 3 — Смена логина/пароля (если не работает через UI):"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}docker exec -it 3x-ui x-ui${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Выбери пункт 7 — 'Reset username and password'${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${BOLD}VLESS-Reality (порт ${P_VLESS_REALITY}):${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}    Protocol: vless | Network: tcp | Security: reality"
-echo -e "${BOLD}${YELLOW}║${NC}    uTLS: chrome | Dest: www.apple.com:443"
-echo -e "${BOLD}${YELLOW}║${NC}    Server Names: www.apple.com"
-echo -e "${BOLD}${YELLOW}║${NC}    Flow: xtls-rprx-vision"
-echo -e "${BOLD}${YELLOW}║${NC}    (ключи Reality генерирует кнопкой ↻ сам)"
+echo -e "${BOLD}${YELLOW}║${NC}  Шаг 4 — Установка сертификата для Xray-inbounds:"
+echo -e "${BOLD}${YELLOW}║${NC}    Найди сертификат NPM для ${XUI_DOMAIN}:"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}ls /opt/docker/nginx-proxy-manager/letsencrypt/live/${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Скопируй в папку 3x-ui:"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}XUI_CERT_DIR=\$(ls /opt/docker/nginx-proxy-manager/letsencrypt/live/ \\${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}  | grep ${XUI_DOMAIN} | head -1)${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}cp /opt/docker/nginx-proxy-manager/letsencrypt/live/\${XUI_CERT_DIR}/fullchain.pem \\${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}   /opt/docker/3x-ui/cert/fullchain.pem${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}cp /opt/docker/nginx-proxy-manager/letsencrypt/live/\${XUI_CERT_DIR}/privkey.pem \\${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}   /opt/docker/3x-ui/cert/privkey.pem${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${BOLD}VLESS-XHTTP (порт ${P_VLESS_XHTTP}):${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}    Protocol: vless | Network: xhttp"
-echo -e "${BOLD}${YELLOW}║${NC}    Security: tls | Path: /xhttp"
+echo -e "${BOLD}${YELLOW}║${NC}  Шаг 5 — В панели 3x-ui → Panel Settings:"
+echo -e "${BOLD}${YELLOW}║${NC}    Panel Certificate Public Key  : ${GREEN}/root/cert/fullchain.pem${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Panel Certificate Private Key : ${GREEN}/root/cert/privkey.pem${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    (путь внутри контейнера — так и вводи)"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${BOLD}Trojan (порт ${P_TROJAN}):${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}    Protocol: trojan | Network: tcp | Security: tls"
-echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}  ${BOLD}Shadowsocks (порт ${P_SS}):${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}    Protocol: shadowsocks"
-echo -e "${BOLD}${YELLOW}║${NC}    Method: chacha20-ietf-poly1305 | Network: tcp,udp"
-echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Шаг 6 — Проверка:"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}docker ps | grep 3x-ui${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    ${CYAN}docker logs 3x-ui --tail 20${NC}"
+echo -e "${BOLD}${YELLOW}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-read -rp "$(echo -e "${BOLD}Настрой NPM + Inbounds, проверь https://${XUI_DOMAIN} → Enter:${NC} ")" _
+
+# ── Автоматическое копирование сертификата ───────────────────────────────────
+log_section "5.1 — Копируем сертификат NPM → 3x-ui"
+
+LETSENCRYPT_DIR="/opt/docker/nginx-proxy-manager/letsencrypt/live"
+log_info "Ищем сертификат для ${XUI_DOMAIN}..."
+
+# NPM называет папки по-разному — по домену или по числовому ID + домену
+CERT_FOUND=""
+for dir in "${LETSENCRYPT_DIR}"/*/; do
+  if echo "$dir" | grep -qi "${XUI_DOMAIN}"; then
+    CERT_FOUND="$dir"
+    break
+  fi
+done
+
+# Если не нашли по домену — ищем по fullchain.pem (берём самый свежий)
+if [[ -z "$CERT_FOUND" ]]; then
+  CERT_FOUND=$(find "${LETSENCRYPT_DIR}" -name "fullchain.pem" \
+    -exec stat --format='%Y %n' {} \; 2>/dev/null | sort -rn | head -1 | awk '{print $2}' | xargs dirname 2>/dev/null || true)
+fi
+
+if [[ -n "$CERT_FOUND" && -f "${CERT_FOUND}/fullchain.pem" ]]; then
+  cp "${CERT_FOUND}/fullchain.pem" /opt/docker/3x-ui/cert/fullchain.pem
+  cp "${CERT_FOUND}/privkey.pem"   /opt/docker/3x-ui/cert/privkey.pem
+  chmod 644 /opt/docker/3x-ui/cert/fullchain.pem
+  chmod 600 /opt/docker/3x-ui/cert/privkey.pem
+  log_ok "Сертификат скопирован: ${CERT_FOUND} → /opt/docker/3x-ui/cert/"
+  log_info "Пути внутри контейнера для Panel Settings:"
+  log_info "  Public key:  /root/cert/fullchain.pem"
+  log_info "  Private key: /root/cert/privkey.pem"
+else
+  log_warn "Сертификат NPM ещё не создан — выполни шаги 1–3 выше, затем:"
+  log_warn "  XUI_CERT_DIR=\$(ls ${LETSENCRYPT_DIR} | grep ${XUI_DOMAIN} | head -1)"
+  log_warn "  cp ${LETSENCRYPT_DIR}/\${XUI_CERT_DIR}/fullchain.pem /opt/docker/3x-ui/cert/fullchain.pem"
+  log_warn "  cp ${LETSENCRYPT_DIR}/\${XUI_CERT_DIR}/privkey.pem   /opt/docker/3x-ui/cert/privkey.pem"
+fi
+
+read -rp "$(echo -e "${BOLD}Настрой NPM Proxy Host и войди в панель → Enter:${NC} ")" _
 
 stage_done 5 "3x-ui" \
   "cd /opt/docker/3x-ui && docker compose down
@@ -957,6 +915,9 @@ HOME_DIR=$(getent passwd "$NEW_USER" | cut -d: -f6)
 ACME="${HOME_DIR}/.acme.sh/acme.sh"
 CERT_DIR="/opt/docker/hysteria2/cert"
 
+# Убеждаемся что папка принадлежит пользователю ДО запуска acme.sh
+chown -R "${NEW_USER}:${NEW_USER}" "${CERT_DIR}"
+
 # ── DNS проверка ──────────────────────────────────────────────────────────────
 wait_dns "${H2_DOMAIN}" "${SERVER_IP}"
 
@@ -970,25 +931,24 @@ else
   log_ok "acme.sh установлен"
 fi
 
-chown -R "${NEW_USER}:${NEW_USER}" "${CERT_DIR}"
-
 # ── Сертификат ───────────────────────────────────────────────────────────────
 log_section "6.2 — TLS-сертификат для ${H2_DOMAIN}"
 
-ACME_WEBROOT="/opt/docker/nginx-proxy-manager/data/letsencrypt-acme-challenge"
-mkdir -p "$ACME_WEBROOT"
-chown -R "${NEW_USER}:${NEW_USER}" "$ACME_WEBROOT"
-
 CERT_OBTAINED=false
 
-# Проверяем — может сертификат уже есть
+# Проверяем — может сертификат уже есть и действителен
 if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
-  EXPIRY=$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+  EXPIRY=$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2 || echo "?")
   log_warn "Сертификат уже существует (истекает: ${EXPIRY}) — пропускаю получение"
   CERT_OBTAINED=true
 fi
 
 if [[ "$CERT_OBTAINED" == "false" ]]; then
+  # Acme challenge dir, который NPM отдаёт через port 80
+  ACME_WEBROOT="/opt/docker/nginx-proxy-manager/data/letsencrypt-acme-challenge"
+  mkdir -p "$ACME_WEBROOT"
+  chown -R "${NEW_USER}:${NEW_USER}" "$ACME_WEBROOT"
+
   log_info "Пробуем webroot через NPM..."
   if su - "$NEW_USER" -c "
     ${ACME} --issue -d ${H2_DOMAIN} \
@@ -1018,7 +978,12 @@ fi
 
 [[ "$CERT_OBTAINED" == "true" ]] || die "Не удалось получить сертификат для ${H2_DOMAIN}. Убедись что DNS настроен и порт 80 открыт."
 
-# ── Установка сертификата ─────────────────────────────────────────────────────
+# ── Установка сертификата в нужное место ─────────────────────────────────────
+log_section "6.3 — Установка сертификата"
+
+# chown снова — acme.sh мог создать файлы от имени пользователя
+chown -R "${NEW_USER}:${NEW_USER}" "${CERT_DIR}"
+
 su - "$NEW_USER" -c "
   ${ACME} --install-cert -d ${H2_DOMAIN} \
     --cert-file     ${CERT_DIR}/cert.pem \
@@ -1027,10 +992,10 @@ su - "$NEW_USER" -c "
     --reloadcmd 'docker restart hysteria2 2>/dev/null || true'
 " && log_ok "Сертификат установлен в ${CERT_DIR}/"
 
-[[ -f "${CERT_DIR}/fullchain.pem" ]] || die "Файл сертификата не найден!"
+[[ -f "${CERT_DIR}/fullchain.pem" ]] || die "Файл сертификата не найден в ${CERT_DIR}/"
 
 # ── Конфиг ───────────────────────────────────────────────────────────────────
-log_section "6.3 — Конфиг Hysteria 2"
+log_section "6.4 — Конфиг Hysteria 2"
 
 cat > /opt/docker/hysteria2/config.yaml << EOF
 listen: :${P_H2}
@@ -1082,16 +1047,16 @@ networks:
 EOF
 
 cd /opt/docker/hysteria2
-if docker ps --format '{{.Names}}' | grep -q hysteria2; then
+if docker ps --format '{{.Names}}' | grep -q "^hysteria2$"; then
   docker compose down
 fi
 docker compose up -d
 sleep 10
 
-docker ps --format '{{.Names}} {{.Status}}' | grep hysteria2 | grep -q "Up" && \
+docker ps --format '{{.Names}} {{.Status}}' | grep "hysteria2" | grep -q "Up" && \
   log_ok "Hysteria2 запущен" || log_warn "Hysteria2 не запустился — см. docker logs hysteria2"
-ss -ulnp | grep -q "${P_H2}" && log_ok "UDP ${P_H2} слушает" || \
-  log_warn "UDP ${P_H2} не найден в ss — проверь: docker logs hysteria2"
+ss -ulnp | grep -q ":${P_H2}" && log_ok "UDP ${P_H2} слушает" || \
+  log_warn "UDP ${P_H2} не найден — проверь: docker logs hysteria2"
 
 stage_done 6 "Hysteria 2" \
   "cd /opt/docker/hysteria2 && docker compose down
@@ -1106,8 +1071,20 @@ if [[ "$START_STAGE" -le 7 ]]; then
 
 log_step "ЭТАП 7 — Telemt MTProxy (Telegram)"
 
-cat > /opt/docker/telemt/config.toml << EOF
-[general]
+# Telemt FakeTLS: секрет для ссылки = ee + RAW_SECRET(32hex) + hex(tls_domain)
+# tls_domain должен ТОЧНО совпадать с censorship.tls_domain в config.toml
+TELEMT_TLS_DOMAIN="www.apple.com"
+TELEMT_DOMAIN_HEX=$(python3 -c "print('${TELEMT_TLS_DOMAIN}'.encode().hex())")
+TELEMT_LINK_SECRET="ee${TELEMT_SECRET}${TELEMT_DOMAIN_HEX}"
+TELEMT_TG_LINK="tg://proxy?server=${SERVER_IP}&port=${P_TELEMT}&secret=${TELEMT_LINK_SECRET}"
+TELEMT_HTTPS_LINK="https://t.me/proxy?server=${SERVER_IP}&port=${P_TELEMT}&secret=${TELEMT_LINK_SECRET}"
+
+# ВАЖНО: config.toml пишем через python3, чтобы Telegram Desktop
+# не мог повредить строку с доменом через markdown-конвертацию при копировании.
+# Значение tls_domain не должно содержать www.example.com как гиперссылку.
+python3 -c "
+import sys
+config = '''[general]
 use_middle_proxy = true
 
 [general.modes]
@@ -1116,18 +1093,24 @@ secure  = false
 tls     = true
 
 [general.links]
-show = "*"
+show = \"*\"
 
 [server]
 port = ${P_TELEMT}
 
 [censorship]
-tls_domain = "www.apple.com"
+tls_domain = \"www.apple.com\"
 
 [access.users]
-main = "${TELEMT_SECRET}"
-EOF
+main = \"${TELEMT_SECRET}\"
+'''
+with open('/opt/docker/telemt/config.toml', 'w') as f:
+    f.write(config)
+"
 
+# Docker Compose для Telemt
+# ВАЖНО: tmpfs убран — он конфликтовал с volumes (монтировал tmpfs поверх config.toml).
+# Безопасность обеспечивается cap_drop + read_only + no-new-privileges.
 cat > /opt/docker/telemt/docker-compose.yml << EOF
 services:
   telemt:
@@ -1137,7 +1120,7 @@ services:
     ports:
       - "${P_TELEMT}:${P_TELEMT}"
     volumes:
-      - ./config.toml:/run/telemt/config.toml:ro
+      - /opt/docker/telemt/config.toml:/run/telemt/config.toml:ro
     working_dir: /run/telemt
     environment:
       - RUST_LOG=info
@@ -1152,8 +1135,6 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    tmpfs:
-      - /run/telemt:rw,mode=1777,size=1m
     deploy:
       resources:
         limits:
@@ -1170,17 +1151,20 @@ networks:
 EOF
 
 cd /opt/docker/telemt
-if docker ps --format '{{.Names}}' | grep -q telemt; then
+if docker ps --format '{{.Names}}' | grep -q "^telemt$"; then
   docker compose down
 fi
 docker compose pull
 docker compose up -d
 sleep 10
 
-docker ps --format '{{.Names}} {{.Status}}' | grep telemt | grep -q "Up" && \
+docker ps --format '{{.Names}} {{.Status}}' | grep "telemt" | grep -q "Up" && \
   log_ok "Telemt запущен" || log_warn "Telemt не запустился — см. docker logs telemt"
 
-TELEMT_LINK=$(docker logs telemt 2>&1 | grep -i "tg://" | head -1 || echo "см. docker logs telemt")
+echo ""
+log_info "Telegram MTProxy ссылки:"
+echo -e "  ${CYAN}${TELEMT_TG_LINK}${NC}"
+echo -e "  ${CYAN}${TELEMT_HTTPS_LINK}${NC}"
 
 stage_done 7 "Telemt MTProxy" \
   "cd /opt/docker/telemt && docker compose down
@@ -1193,7 +1177,11 @@ fi  # END STAGE 7
 # =============================================================================
 log_step "УСТАНОВКА ЗАВЕРШЕНА"
 
-TELEMT_LINK=$(docker logs telemt 2>&1 | grep -i "tg://" | head -1 2>/dev/null || echo "docker logs telemt | grep tg://")
+# Формируем правильную FakeTLS ссылку (на случай если переменные живы)
+TELEMT_TLS_DOMAIN="www.apple.com"
+TELEMT_DOMAIN_HEX=$(python3 -c "print('${TELEMT_TLS_DOMAIN}'.encode().hex())" 2>/dev/null || echo "")
+TELEMT_LINK_SECRET="ee${TELEMT_SECRET}${TELEMT_DOMAIN_HEX}"
+TELEMT_TG_LINK="tg://proxy?server=${SERVER_IP}&port=${P_TELEMT}&secret=${TELEMT_LINK_SECRET}"
 
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -1204,9 +1192,11 @@ echo -e "${BOLD}${GREEN}║${NC}  ${CYAN}ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER
 echo -e "${BOLD}${GREEN}║${NC}"
 echo -e "${BOLD}${GREEN}║  ПАНЕЛИ${NC}"
 echo -e "${BOLD}${GREEN}║${NC}  NPM:   ${CYAN}https://${NPM_DOMAIN}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  3x-ui: ${CYAN}https://${XUI_DOMAIN}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Логин: ${YELLOW}${NEW_USER}${NC}  Пароль: ${YELLOW}${XUI_PASS}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  3x-ui: ${CYAN}https://${XUI_DOMAIN}${NC}  (admin / admin → смени через x-ui CLI)"
 echo -e "${BOLD}${GREEN}║${NC}  Сайт:  ${CYAN}https://${ROOT_DOMAIN}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}"
+echo -e "${BOLD}${GREEN}║  Смена логина/пароля 3x-ui:${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  ${CYAN}docker exec -it 3x-ui x-ui${NC}  → пункт 7"
 echo -e "${BOLD}${GREEN}║${NC}"
 echo -e "${BOLD}${GREEN}║  VPN${NC}"
 echo -e "${BOLD}${GREEN}║${NC}  VLESS-Reality : ${YELLOW}${SERVER_IP}:${P_VLESS_REALITY}${NC}"
@@ -1219,9 +1209,10 @@ echo -e "${BOLD}${GREEN}║${NC}  ${YELLOW}${H2_DOMAIN}:${P_H2}${NC} (UDP)"
 echo -e "${BOLD}${GREEN}║${NC}  Пароль: ${YELLOW}${H2_PASS}${NC}"
 echo -e "${BOLD}${GREEN}║${NC}  URI: ${CYAN}hysteria2://${H2_PASS}@${H2_DOMAIN}:${P_H2}?sni=${H2_DOMAIN}#H2${NC}"
 echo -e "${BOLD}${GREEN}║${NC}"
-echo -e "${BOLD}${GREEN}║  TELEGRAM MTProxy${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Секрет: ${YELLOW}${TELEMT_SECRET}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  ${CYAN}${TELEMT_LINK}${NC}"
+echo -e "${BOLD}${GREEN}║  TELEGRAM MTProxy (FakeTLS)${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  Сервер:  ${YELLOW}${SERVER_IP}:${P_TELEMT}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  Секрет:  ${YELLOW}${TELEMT_LINK_SECRET}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  ${CYAN}${TELEMT_TG_LINK}${NC}"
 echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${BOLD}${GREEN}║  КОНТЕЙНЕРЫ${NC}"
 docker ps --format "  {{.Names}}: {{.Status}}" 2>/dev/null || true
@@ -1230,18 +1221,23 @@ echo -e "${BOLD}${GREEN}║  ПАМЯТЬ${NC}"
 docker stats --no-stream --format "  {{.Name}}: {{.MemUsage}}" 2>/dev/null || true
 echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
-# ── Сохраняем в файл ─────────────────────────────────────────────────────────
+# ── Сохраняем сводку в файл ───────────────────────────────────────────────────
 SUMMARY_FILE="/root/vps-setup-summary.txt"
 {
   echo "=== VPS SETUP SUMMARY — $(date) ==="
   echo ""
-  echo "SSH:    ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP}"
+  echo "SSH: ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP}"
   echo ""
   echo "--- Panels ---"
   echo "NPM:          https://${NPM_DOMAIN}"
   echo "3x-ui:        https://${XUI_DOMAIN}"
-  echo "3x-ui login:  ${NEW_USER} / ${XUI_PASS}"
+  echo "  Логин/пароль менять через: docker exec -it 3x-ui x-ui  (пункт 7)"
   echo "Site:         https://${ROOT_DOMAIN}"
+  echo ""
+  echo "--- Сертификаты для 3x-ui (inbounds) ---"
+  echo "Public key:  /root/cert/fullchain.pem  (внутри контейнера)"
+  echo "Private key: /root/cert/privkey.pem   (внутри контейнера)"
+  echo "На хосте: /opt/docker/3x-ui/cert/"
   echo ""
   echo "--- VPN Ports ---"
   echo "VLESS-Reality: ${SERVER_IP}:${P_VLESS_REALITY}"
@@ -1254,15 +1250,20 @@ SUMMARY_FILE="/root/vps-setup-summary.txt"
   echo "Pass:    ${H2_PASS}"
   echo "URI:     hysteria2://${H2_PASS}@${H2_DOMAIN}:${P_H2}?sni=${H2_DOMAIN}#H2"
   echo ""
-  echo "--- Telemt ---"
-  echo "Secret:  ${TELEMT_SECRET}"
-  echo "Link:    ${TELEMT_LINK}"
+  echo "--- Telemt FakeTLS ---"
+  echo "Сервер:  ${SERVER_IP}:${P_TELEMT}"
+  echo "Секрет:  ${TELEMT_LINK_SECRET}"
+  echo "Ссылка:  ${TELEMT_TG_LINK}"
   echo ""
-  echo "--- SQLite 3x-ui (если нужно поменять пароль вручную) ---"
-  echo "sqlite3 /opt/docker/3x-ui/db/x-ui.db"
-  echo "UPDATE settings SET value='ВАШ_ЛОГИН' WHERE key='webUsername';"
-  echo "UPDATE settings SET value='ВАШ_ПАРОЛЬ' WHERE key='webPassword';"
-  echo ".quit && docker restart 3x-ui"
+  echo "--- Полезные команды ---"
+  echo "docker exec -it 3x-ui x-ui           # CLI панели 3x-ui"
+  echo "docker logs nginx-proxy-manager -f    # логи NPM"
+  echo "docker logs 3x-ui -f                 # логи 3x-ui"
+  echo "docker logs hysteria2 -f             # логи Hysteria2"
+  echo "docker logs telemt -f                # логи Telemt"
+  echo "docker stats --no-stream             # потребление памяти"
+  echo "ufw status verbose                   # статус брандмауэра"
+  echo "fail2ban-client status sshd          # статус Fail2Ban"
 } > "$SUMMARY_FILE"
 chmod 600 "$SUMMARY_FILE"
 

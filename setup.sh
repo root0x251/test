@@ -305,25 +305,27 @@ read -rp "$(echo -e "${BOLD}${RED}Всё верно? Продолжить? (yes/
 # Сохраняем переменные сразу
 save_vars
 
-# ── Обновление системы (сразу после сбора данных) ────────────────────────────
-log_section "Обновление системы (фоновый процесс)"
-log_info "Запускаем обновление пакетов в фоне, пока скрипт продолжает работу..."
+# ── Обновление системы ────────────────────────────────────────────────────────
+log_section "Обновление системы"
+log_info "Обновляем пакеты — это может занять несколько минут..."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get upgrade -y -o Dpkg::Options::="--force-confold" -qq &
-APT_UPGRADE_PID=$!
-log_info "Обновление запущено (PID: ${APT_UPGRADE_PID}). Продолжаем настройку..."
+apt-get upgrade -y -o Dpkg::Options::="--force-confold" -qq
+apt-get autoremove -y -qq
+log_ok "Система обновлена"
 
-# Ставим нужные утилиты не ожидая полного апгрейда
+# ── Установка базовых утилит ──────────────────────────────────────────────────
+log_info "Устанавливаем базовые утилиты..."
 apt-get install -y -o Dpkg::Options::="--force-confold" -qq \
   curl wget git htop net-tools ufw fail2ban unzip \
-  python3 openssl unattended-upgrades apt-listchanges dnsutils
+  python3 openssl unattended-upgrades apt-listchanges dnsutils sqlite3
+log_ok "Утилиты установлены"
 
 # Автообновления безопасности
 dpkg-reconfigure -plow unattended-upgrades <<< $'\n' 2>/dev/null || true
 
-stage_done 0 "Сбор данных + запуск обновления" \
+stage_done 0 "Сбор данных + обновление системы" \
   "rm -f /root/.vps-setup-state /root/.vps-setup-vars — сбросит прогресс"
 
 fi  # END STAGE 0
@@ -477,14 +479,6 @@ systemctl restart fail2ban
 sleep 2
 fail2ban-client ping 2>/dev/null | grep -q "pong" && log_ok "Fail2Ban работает" || \
   log_warn "Fail2Ban не отвечает — проверь: journalctl -u fail2ban"
-
-# Ждём завершения фонового apt-get upgrade (запущен в этапе 0)
-if [[ -n "${APT_UPGRADE_PID:-}" ]] && kill -0 "$APT_UPGRADE_PID" 2>/dev/null; then
-  log_info "Ожидаем завершения обновления системы..."
-  wait "$APT_UPGRADE_PID" && log_ok "Обновление системы завершено" || \
-    log_warn "Обновление завершилось с ошибками — проверь вручную"
-fi
-apt-get autoremove -y -qq
 
 stage_done 1 "Пользователь, SSH, Swap, UFW, Fail2Ban" \
   "SSH откат: cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config && systemctl restart ssh

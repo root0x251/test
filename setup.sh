@@ -369,6 +369,7 @@ configure_ssh "ClientAliveCountMax"    "2"
 configure_ssh "X11Forwarding"          "no"
 configure_ssh "AllowTcpForwarding"     "no"
 
+mkdir -p /run/sshd
 sshd -t || { cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config; die "Ошибка sshd_config — откат выполнен"; }
 systemctl enable ssh
 systemctl restart ssh

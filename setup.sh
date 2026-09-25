@@ -1,34 +1,185 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VPS SETUP SCRIPT
-#  Ubuntu 24.04 LTS · Docker · Nginx Proxy Manager · 3x-ui · Hysteria2 · Telemt
-#  https://github.com/YOUR_USERNAME/vps-setup
+#  VPS SETUP SCRIPT v2.0
+#  Ubuntu 24.04 LTS · Docker · NPM · 3x-ui · Hysteria2 · Telemt
 # =============================================================================
 set -euo pipefail
 
 # ─── Цвета ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m';  BOLD='\033[1m';  NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 log_info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 log_ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
-log_step()    { echo -e "\n${BOLD}${BLUE}══════════════════════════════════════════${NC}"; \
-                echo -e "${BOLD}${BLUE}  $*${NC}"; \
-                echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"; }
+log_step()    { echo -e "\n${BOLD}${BLUE}══════════════════════════════════════════════${NC}"
+                echo -e "${BOLD}${BLUE}  $*${NC}"
+                echo -e "${BOLD}${BLUE}══════════════════════════════════════════════${NC}\n"; }
 log_section() { echo -e "\n${BOLD}${CYAN}── $* ──${NC}\n"; }
+log_rollback(){ echo -e "\n${BOLD}${RED}[ОТКАТ]${NC} $*"; }
 
 die() { log_error "$*"; exit 1; }
 
-# ─── Проверка root ───────────────────────────────────────────────────────────
+# ─── Проверка root ────────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || die "Запусти скрипт от root: sudo bash setup.sh"
 
-# =============================================================================
-#  СБОР ДАННЫХ
-# =============================================================================
-log_step "СБОР ДАННЫХ — введи параметры один раз"
+# ─── Файл состояния ──────────────────────────────────────────────────────────
+STATE_FILE="/root/.vps-setup-state"
+VARS_FILE="/root/.vps-setup-vars"
 
+save_state() { echo "$1" > "$STATE_FILE"; }
+get_state()  { [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || echo "0"; }
+
+# Сохраняем переменные между запусками
+save_vars() {
+  cat > "$VARS_FILE" << VARS
+NEW_USER="${NEW_USER}"
+USER_PASS="${USER_PASS}"
+LE_EMAIL="${LE_EMAIL}"
+ROOT_DOMAIN="${ROOT_DOMAIN}"
+NPM_DOMAIN="${NPM_DOMAIN}"
+XUI_DOMAIN="${XUI_DOMAIN}"
+H2_DOMAIN="${H2_DOMAIN}"
+SERVER_IP="${SERVER_IP}"
+XUI_PASS="${XUI_PASS}"
+H2_PASS="${H2_PASS}"
+TELEMT_SECRET="${TELEMT_SECRET}"
+SSH_PORT="${SSH_PORT}"
+XUI_PORT="${XUI_PORT}"
+P_VLESS_REALITY="${P_VLESS_REALITY}"
+P_VLESS_XHTTP="${P_VLESS_XHTTP}"
+P_TROJAN="${P_TROJAN}"
+P_SS="${P_SS}"
+P_H2="${P_H2}"
+P_TELEMT="${P_TELEMT}"
+VARS
+  chmod 600 "$VARS_FILE"
+}
+
+load_vars() {
+  [[ -f "$VARS_FILE" ]] && source "$VARS_FILE" || true
+}
+
+# ─── Проверка DNS ─────────────────────────────────────────────────────────────
+check_dns() {
+  local domain="$1"; local expected_ip="$2"
+  local resolved
+  resolved=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+  if [[ "$resolved" == "$expected_ip" ]]; then
+    log_ok "DNS: ${domain} → ${resolved} ✓"
+    return 0
+  elif [[ -z "$resolved" ]]; then
+    log_warn "DNS: ${domain} → не резолвится (ещё не распространился или запись не добавлена)"
+    return 1
+  else
+    log_warn "DNS: ${domain} → ${resolved} (ожидаем ${expected_ip})"
+    return 1
+  fi
+}
+
+wait_dns() {
+  local domain="$1"; local expected_ip="$2"
+  log_info "Проверяем DNS для ${domain}..."
+  if check_dns "$domain" "$expected_ip"; then
+    return 0
+  fi
+  echo ""
+  echo -e "${YELLOW}DNS ещё не распространился. Варианты:${NC}"
+  echo "  1) Подождать и проверить снова"
+  echo "  2) Продолжить без проверки (если уверен что DNS настроен)"
+  echo "  3) Выйти и настроить DNS"
+  read -rp "Выбор [1/2/3]: " dns_choice
+  case "$dns_choice" in
+    1)
+      log_info "Ждём 30 секунд..."
+      sleep 30
+      wait_dns "$domain" "$expected_ip"
+      ;;
+    2)
+      log_warn "Продолжаем без подтверждения DNS — Let's Encrypt может упасть"
+      ;;
+    *)
+      die "Настрой DNS и перезапусти скрипт с нужного этапа"
+      ;;
+  esac
+}
+
+# ─── Итог этапа и инструкция отката ─────────────────────────────────────────
+stage_done() {
+  local stage_num="$1"; local stage_name="$2"; local rollback_hint="$3"
+  save_state "$stage_num"
+  echo ""
+  echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${GREEN}║  ✓ Этап ${stage_num} завершён: ${stage_name}${NC}"
+  echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════╣${NC}"
+  echo -e "${BOLD}${GREEN}║${NC}  ${YELLOW}Если нужно откатить этот этап:${NC}"
+  echo -e "${BOLD}${GREEN}║${NC}  ${rollback_hint}"
+  echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
+  echo ""
+}
+
+# =============================================================================
+#  МЕНЮ СТАРТА
+# =============================================================================
+CURRENT_STATE=$(get_state)
+
+echo -e "\n${BOLD}${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${BLUE}║           VPS SETUP SCRIPT v2.0                     ║${NC}"
+echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════╝${NC}\n"
+
+if [[ "$CURRENT_STATE" != "0" ]]; then
+  echo -e "${YELLOW}Найдено сохранённое состояние: завершён этап ${CURRENT_STATE}${NC}"
+  echo ""
+  echo "Выбери действие:"
+  echo "  1) Продолжить с этапа $((CURRENT_STATE + 1))"
+  echo "  2) Начать заново (новая установка)"
+  echo "  3) Начать с конкретного этапа"
+  echo "  4) Показать список этапов"
+  echo ""
+  read -rp "Выбор [1/2/3/4]: " start_choice
+  case "$start_choice" in
+    1) START_STAGE=$((CURRENT_STATE + 1))
+       load_vars ;;
+    2) START_STAGE=0
+       rm -f "$STATE_FILE" "$VARS_FILE" ;;
+    3) echo ""
+       echo "Этапы:"
+       echo "  0 — Сбор данных + обновление системы"
+       echo "  1 — Пользователь, SSH, Swap, UFW, Fail2Ban"
+       echo "  2 — Docker, папки, сеть"
+       echo "  3 — Nginx Proxy Manager"
+       echo "  4 — Nginx сайт-заглушка"
+       echo "  5 — 3x-ui (VPN панель)"
+       echo "  6 — Hysteria 2"
+       echo "  7 — Telemt MTProxy"
+       read -rp "Начать с этапа: " START_STAGE
+       load_vars ;;
+    4) echo ""
+       echo "Этапы:"
+       echo "  0 — Сбор данных + обновление системы"
+       echo "  1 — Пользователь, SSH, Swap, UFW, Fail2Ban"
+       echo "  2 — Docker, папки, сеть"
+       echo "  3 — Nginx Proxy Manager"
+       echo "  4 — Nginx сайт-заглушка"
+       echo "  5 — 3x-ui (VPN панель)"
+       echo "  6 — Hysteria 2"
+       echo "  7 — Telemt MTProxy"
+       echo ""
+       read -rp "Начать с этапа: " START_STAGE
+       load_vars ;;
+    *) START_STAGE=0 ;;
+  esac
+else
+  START_STAGE=0
+fi
+
+# =============================================================================
+#  ЭТАП 0 — СБОР ДАННЫХ + ОБНОВЛЕНИЕ СИСТЕМЫ
+# =============================================================================
+if [[ "$START_STAGE" -le 0 ]]; then
+
+log_step "ЭТАП 0 — Сбор данных"
 echo -e "${YELLOW}Все данные вводятся сейчас. Скрипт больше не будет спрашивать.${NC}\n"
 
 # ── Имя пользователя ──────────────────────────────────────────────────────────
@@ -39,15 +190,16 @@ while true; do
 done
 
 # ── Пароль пользователя ───────────────────────────────────────────────────────
+echo -e "${CYAN}Рекомендуем пароль 12+ символов. Подтверждение паролей обязательно.${NC}"
 while true; do
-  read -rsp "$(echo -e "${BOLD}Пароль для $NEW_USER (мин. 16 символов):${NC} ")" USER_PASS; echo
-  read -rsp "$(echo -e "${BOLD}Повтори пароль:${NC} ")"                           USER_PASS2; echo
-  [[ "$USER_PASS" == "$USER_PASS2" ]] || { log_warn "Пароли не совпадают"; continue; }
-  [[ ${#USER_PASS} -ge 16 ]]          || { log_warn "Минимум 16 символов"; continue; }
-  break
+  read -rsp "$(echo -e "${BOLD}Пароль для ${NEW_USER}:${NC} ")" USER_PASS; echo
+  [[ -z "$USER_PASS" ]] && { log_warn "Пароль не может быть пустым"; continue; }
+  read -rsp "$(echo -e "${BOLD}Повтори пароль:${NC} ")" USER_PASS2; echo
+  [[ "$USER_PASS" == "$USER_PASS2" ]] && break
+  log_warn "Пароли не совпадают"
 done
 
-# ── Email (Let's Encrypt) ─────────────────────────────────────────────────────
+# ── Email ─────────────────────────────────────────────────────────────────────
 while true; do
   read -rp "$(echo -e "${BOLD}Email для Let's Encrypt / acme.sh:${NC} ")" LE_EMAIL
   [[ "$LE_EMAIL" =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
@@ -58,27 +210,24 @@ done
 while true; do
   read -rp "$(echo -e "${BOLD}Основной домен (например: example.ru):${NC} ")" ROOT_DOMAIN
   [[ "$ROOT_DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && break
-  log_warn "Введи корректный домен без http:// и слешей"
+  log_warn "Введи домен без http:// и слешей"
 done
 
 echo ""
-echo -e "${CYAN}Субдомены будут созданы автоматически:${NC}"
-echo -e "  ${GREEN}npm.${ROOT_DOMAIN}${NC}      → панель Nginx Proxy Manager"
-echo -e "  ${GREEN}cdn.${ROOT_DOMAIN}${NC}      → панель 3x-ui"
-echo -e "  ${GREEN}hist.${ROOT_DOMAIN}${NC}     → Hysteria2 (TLS-сертификат)"
-echo -e "  ${GREEN}${ROOT_DOMAIN}${NC}          → сайт-заглушка"
-echo -e "  ${GREEN}www.${ROOT_DOMAIN}${NC}      → сайт-заглушка"
+echo -e "${CYAN}Субдомены по умолчанию:${NC}"
+echo -e "  npm.${ROOT_DOMAIN}   → NPM панель"
+echo -e "  cdn.${ROOT_DOMAIN}   → 3x-ui панель"
+echo -e "  hist.${ROOT_DOMAIN}  → Hysteria2"
 echo ""
 read -rp "$(echo -e "${BOLD}Использовать эти субдомены? (y/n):${NC} ")" SUBDOMAIN_CONFIRM
-if [[ "$SUBDOMAIN_CONFIRM" != "y" && "$SUBDOMAIN_CONFIRM" != "Y" ]]; then
-  echo ""
-  read -rp "$(echo -e "${BOLD}Субдомен для NPM-панели (например: npm.${ROOT_DOMAIN}):${NC} ")"  NPM_DOMAIN
-  read -rp "$(echo -e "${BOLD}Субдомен для 3x-ui (например: cdn.${ROOT_DOMAIN}):${NC} ")"       XUI_DOMAIN
-  read -rp "$(echo -e "${BOLD}Субдомен для Hysteria2 (например: hist.${ROOT_DOMAIN}):${NC} ")"  H2_DOMAIN
-else
+if [[ "$SUBDOMAIN_CONFIRM" =~ ^[Yy]$ ]]; then
   NPM_DOMAIN="npm.${ROOT_DOMAIN}"
   XUI_DOMAIN="cdn.${ROOT_DOMAIN}"
   H2_DOMAIN="hist.${ROOT_DOMAIN}"
+else
+  read -rp "$(echo -e "${BOLD}Субдомен для NPM-панели:${NC} ")"  NPM_DOMAIN
+  read -rp "$(echo -e "${BOLD}Субдомен для 3x-ui:${NC} ")"       XUI_DOMAIN
+  read -rp "$(echo -e "${BOLD}Субдомен для Hysteria2:${NC} ")"   H2_DOMAIN
 fi
 
 # ── IP сервера ────────────────────────────────────────────────────────────────
@@ -86,118 +235,143 @@ SERVER_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
             curl -s --max-time 5 https://ifconfig.me  2>/dev/null || \
             hostname -I | awk '{print $1}')
 echo ""
-log_info "Определён IP сервера: ${GREEN}${SERVER_IP}${NC}"
-read -rp "$(echo -e "${BOLD}Верно? Или введи IP вручную (Enter = использовать ${SERVER_IP}):${NC} ")" IP_INPUT
+log_info "Определён IP: ${GREEN}${SERVER_IP}${NC}"
+read -rp "$(echo -e "${BOLD}Верно? Или введи IP вручную (Enter = ${SERVER_IP}):${NC} ")" IP_INPUT
 [[ -n "$IP_INPUT" ]] && SERVER_IP="$IP_INPUT"
 
-# ── Пароль для 3x-ui ─────────────────────────────────────────────────────────
+# ── Порт SSH ──────────────────────────────────────────────────────────────────
+echo ""
+read -rp "$(echo -e "${BOLD}Порт SSH (Enter = 3270):${NC} ")" SSH_PORT
+SSH_PORT=${SSH_PORT:-3270}
+
+# ── Порт панели 3x-ui ────────────────────────────────────────────────────────
+read -rp "$(echo -e "${BOLD}Порт панели 3x-ui (Enter = 2053):${NC} ")" XUI_PORT
+XUI_PORT=${XUI_PORT:-2053}
+
+# ── Пароль 3x-ui ─────────────────────────────────────────────────────────────
 echo ""
 log_section "Параметры 3x-ui"
+echo -e "${CYAN}Рекомендуем пароль 12+ символов.${NC}"
 while true; do
-  read -rsp "$(echo -e "${BOLD}Пароль для панели 3x-ui (мин. 16 символов):${NC} ")" XUI_PASS; echo
-  read -rsp "$(echo -e "${BOLD}Повтори пароль:${NC} ")"                              XUI_PASS2; echo
-  [[ "$XUI_PASS" == "$XUI_PASS2" ]] || { log_warn "Пароли не совпадают"; continue; }
-  [[ ${#XUI_PASS} -ge 16 ]]         || { log_warn "Минимум 16 символов"; continue; }
-  break
+  read -rsp "$(echo -e "${BOLD}Пароль для панели 3x-ui:${NC} ")" XUI_PASS; echo
+  [[ -z "$XUI_PASS" ]] && { log_warn "Пароль не может быть пустым"; continue; }
+  read -rsp "$(echo -e "${BOLD}Повтори пароль:${NC} ")" XUI_PASS2; echo
+  [[ "$XUI_PASS" == "$XUI_PASS2" ]] && break
+  log_warn "Пароли не совпадают"
 done
 
-# ── Пароль Hysteria2 ──────────────────────────────────────────────────────────
+# ── Автогенерация секретов ────────────────────────────────────────────────────
 H2_PASS=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-log_info "Пароль Hysteria2 сгенерирован автоматически"
-
-# ── Секрет Telemt ─────────────────────────────────────────────────────────────
 TELEMT_SECRET=$(openssl rand -hex 16)
+log_info "Пароль Hysteria2 сгенерирован автоматически"
 log_info "Секрет Telemt MTProxy сгенерирован автоматически"
 
-# ── Порты VPN ──────────────────────────────────────────────────────────────────
+# ── Порты VPN ─────────────────────────────────────────────────────────────────
 echo ""
-log_section "Порты VPN (нажми Enter для значений по умолчанию)"
-read -rp "$(echo -e "${BOLD}Порт VLESS-Reality     [8443]:${NC} ")" P_VLESS_REALITY;  P_VLESS_REALITY=${P_VLESS_REALITY:-8443}
-read -rp "$(echo -e "${BOLD}Порт VLESS-XHTTP       [8448]:${NC} ")" P_VLESS_XHTTP;    P_VLESS_XHTTP=${P_VLESS_XHTTP:-8448}
-read -rp "$(echo -e "${BOLD}Порт Trojan            [8449]:${NC} ")" P_TROJAN;          P_TROJAN=${P_TROJAN:-8449}
-read -rp "$(echo -e "${BOLD}Порт Shadowsocks       [8445]:${NC} ")" P_SS;              P_SS=${P_SS:-8445}
-read -rp "$(echo -e "${BOLD}Порт Hysteria2 (UDP)   [8444]:${NC} ")" P_H2;              P_H2=${P_H2:-8444}
-read -rp "$(echo -e "${BOLD}Порт Telemt MTProxy    [8446]:${NC} ")" P_TELEMT;          P_TELEMT=${P_TELEMT:-8446}
+log_section "Порты VPN (Enter = значение по умолчанию)"
+read -rp "$(echo -e "${BOLD}VLESS-Reality  [8443]:${NC} ")" P_VLESS_REALITY; P_VLESS_REALITY=${P_VLESS_REALITY:-8443}
+read -rp "$(echo -e "${BOLD}VLESS-XHTTP    [8448]:${NC} ")" P_VLESS_XHTTP;   P_VLESS_XHTTP=${P_VLESS_XHTTP:-8448}
+read -rp "$(echo -e "${BOLD}Trojan         [8449]:${NC} ")" P_TROJAN;         P_TROJAN=${P_TROJAN:-8449}
+read -rp "$(echo -e "${BOLD}Shadowsocks    [8445]:${NC} ")" P_SS;             P_SS=${P_SS:-8445}
+read -rp "$(echo -e "${BOLD}Hysteria2 UDP  [8444]:${NC} ")" P_H2;             P_H2=${P_H2:-8444}
+read -rp "$(echo -e "${BOLD}Telemt MTProxy [8446]:${NC} ")" P_TELEMT;         P_TELEMT=${P_TELEMT:-8446}
 
-# ── Итоговая сводка ───────────────────────────────────────────────────────────
+# ── Сводка ───────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${BLUE}║             СВОДКА ВВЕДЁННЫХ ДАННЫХ                 ║${NC}"
+echo -e "${BOLD}${BLUE}║           СВОДКА ВВЕДЁННЫХ ДАННЫХ                   ║${NC}"
 echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Пользователь SSH   : ${GREEN}${NEW_USER}${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Email (Let's Enc.) : ${GREEN}${LE_EMAIL}${NC}"
-echo -e "${BOLD}${BLUE}║${NC} IP сервера         : ${GREEN}${SERVER_IP}${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Корневой домен     : ${GREEN}${ROOT_DOMAIN}${NC}"
-echo -e "${BOLD}${BLUE}║${NC} NPM панель         : ${GREEN}https://${NPM_DOMAIN}${NC}"
-echo -e "${BOLD}${BLUE}║${NC} 3x-ui панель       : ${GREEN}https://${XUI_DOMAIN}${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Hysteria2 домен    : ${GREEN}${H2_DOMAIN}${NC}"
+echo -e "${BOLD}${BLUE}║${NC} Пользователь  : ${GREEN}${NEW_USER}${NC}"
+echo -e "${BOLD}${BLUE}║${NC} Email         : ${GREEN}${LE_EMAIL}${NC}"
+echo -e "${BOLD}${BLUE}║${NC} IP сервера    : ${GREEN}${SERVER_IP}${NC}"
+echo -e "${BOLD}${BLUE}║${NC} Корневой домен: ${GREEN}${ROOT_DOMAIN}${NC}"
+echo -e "${BOLD}${BLUE}║${NC} NPM панель    : ${GREEN}https://${NPM_DOMAIN}${NC}"
+echo -e "${BOLD}${BLUE}║${NC} 3x-ui панель  : ${GREEN}https://${XUI_DOMAIN}${NC}"
+echo -e "${BOLD}${BLUE}║${NC} Hysteria2     : ${GREEN}${H2_DOMAIN}${NC}"
 echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Порт SSH           : ${GREEN}3270/tcp${NC}"
-echo -e "${BOLD}${BLUE}║${NC} VLESS-Reality      : ${GREEN}${P_VLESS_REALITY}/tcp${NC}"
-echo -e "${BOLD}${BLUE}║${NC} VLESS-XHTTP        : ${GREEN}${P_VLESS_XHTTP}/tcp${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Trojan             : ${GREEN}${P_TROJAN}/tcp${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Shadowsocks        : ${GREEN}${P_SS}/tcp+udp${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Hysteria2          : ${GREEN}${P_H2}/udp${NC}"
-echo -e "${BOLD}${BLUE}║${NC} Telemt MTProxy     : ${GREEN}${P_TELEMT}/tcp${NC}"
+echo -e "${BOLD}${BLUE}║${NC} SSH порт      : ${GREEN}${SSH_PORT}/tcp${NC}"
+echo -e "${BOLD}${BLUE}║${NC} 3x-ui порт   : ${GREEN}${XUI_PORT}/tcp (внутренний)${NC}"
+echo -e "${BOLD}${BLUE}║${NC} VLESS-Reality : ${GREEN}${P_VLESS_REALITY}/tcp${NC}"
+echo -e "${BOLD}${BLUE}║${NC} VLESS-XHTTP  : ${GREEN}${P_VLESS_XHTTP}/tcp${NC}"
+echo -e "${BOLD}${BLUE}║${NC} Trojan        : ${GREEN}${P_TROJAN}/tcp${NC}"
+echo -e "${BOLD}${BLUE}║${NC} Shadowsocks   : ${GREEN}${P_SS}/tcp+udp${NC}"
+echo -e "${BOLD}${BLUE}║${NC} Hysteria2     : ${GREEN}${P_H2}/udp${NC}"
+echo -e "${BOLD}${BLUE}║${NC} Telemt        : ${GREEN}${P_TELEMT}/tcp${NC}"
 echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-read -rp "$(echo -e "${BOLD}${RED}Всё верно? Продолжить установку? (yes/no):${NC} ")" FINAL_CONFIRM
+read -rp "$(echo -e "${BOLD}${RED}Всё верно? Продолжить? (yes/no):${NC} ")" FINAL_CONFIRM
 [[ "$FINAL_CONFIRM" == "yes" ]] || die "Установка отменена"
 
-# =============================================================================
-#  ШАБЛОН ПАУЗЫ И ПРОВЕРКИ
-# =============================================================================
-check_ok() {
-  local desc="$1"; local cmd="$2"; local expected="$3"
-  local result
-  result=$(eval "$cmd" 2>/dev/null || true)
-  if echo "$result" | grep -q "$expected"; then
-    log_ok "$desc"
-  else
-    log_warn "$desc — неожиданный результат: $result"
-  fi
-}
+# Сохраняем переменные сразу
+save_vars
+
+# ── Обновление системы (сразу после сбора данных) ────────────────────────────
+log_section "Обновление системы (фоновый процесс)"
+log_info "Запускаем обновление пакетов в фоне, пока скрипт продолжает работу..."
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get upgrade -y -o Dpkg::Options::="--force-confold" -qq &
+APT_UPGRADE_PID=$!
+log_info "Обновление запущено (PID: ${APT_UPGRADE_PID}). Продолжаем настройку..."
+
+# Ставим нужные утилиты не ожидая полного апгрейда
+apt-get install -y -o Dpkg::Options::="--force-confold" -qq \
+  curl wget git htop net-tools ufw fail2ban unzip \
+  python3 openssl unattended-upgrades apt-listchanges dnsutils
+
+# Автообновления безопасности
+dpkg-reconfigure -plow unattended-upgrades <<< $'\n' 2>/dev/null || true
+
+stage_done 0 "Сбор данных + запуск обновления" \
+  "rm -f /root/.vps-setup-state /root/.vps-setup-vars — сбросит прогресс"
+
+fi  # END STAGE 0
+
+# После любого START_STAGE нам нужны переменные
+load_vars
 
 # =============================================================================
-#  ШАГ 1 — БАЗОВАЯ НАСТРОЙКА СЕРВЕРА
+#  ЭТАП 1 — ПОЛЬЗОВАТЕЛЬ, SSH, SWAP, UFW, FAIL2BAN
 # =============================================================================
-log_step "ШАГ 1 — Базовая настройка сервера"
+if [[ "$START_STAGE" -le 1 ]]; then
+
+log_step "ЭТАП 1 — Пользователь, SSH, Swap, UFW, Fail2Ban"
 
 # ── 1.1 Пользователь ─────────────────────────────────────────────────────────
 log_section "1.1 — Создание пользователя ${NEW_USER}"
 
 if id "$NEW_USER" &>/dev/null; then
-  log_warn "Пользователь ${NEW_USER} уже существует — пропускаю создание"
+  log_warn "Пользователь ${NEW_USER} уже существует — обновляю пароль"
+  echo "${NEW_USER}:${USER_PASS}" | chpasswd
 else
   useradd -m -s /bin/bash "$NEW_USER"
   echo "${NEW_USER}:${USER_PASS}" | chpasswd
-  usermod -aG sudo "$NEW_USER"
   log_ok "Пользователь ${NEW_USER} создан"
 fi
 
-# Sudo без пароля (для скрипта; уберём после, если нужно)
+usermod -aG sudo "$NEW_USER"
 echo "${NEW_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/"${NEW_USER}"
 chmod 440 /etc/sudoers.d/"${NEW_USER}"
 
-check_ok "Пользователь в группе sudo" "id ${NEW_USER}" "sudo"
+id "$NEW_USER" | grep -q sudo && log_ok "Пользователь в группе sudo" || \
+  log_warn "Пользователь НЕ в группе sudo!"
 
 # ── 1.2 SSH ───────────────────────────────────────────────────────────────────
-log_section "1.2 — Настройка SSH (порт 3270)"
+log_section "1.2 — Настройка SSH (порт ${SSH_PORT})"
 
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 
-# Применяем параметры через sed (идемпотентно)
 configure_ssh() {
   local param="$1"; local value="$2"; local file="/etc/ssh/sshd_config"
-  # Если параметр уже есть (закомментирован или нет) — заменяем
-  if grep -qE "^#?\s*${param}\s" "$file"; then
-    sed -i "s|^#\?\s*${param}\s.*|${param} ${value}|" "$file"
+  if grep -qE "^#?\s*${param}\b" "$file"; then
+    sed -i -E "s|^#?\s*${param}\b.*|${param} ${value}|" "$file"
   else
     echo "${param} ${value}" >> "$file"
   fi
 }
 
-configure_ssh "Port"                   "3270"
+configure_ssh "Port"                   "${SSH_PORT}"
 configure_ssh "PermitRootLogin"        "no"
 configure_ssh "PasswordAuthentication" "yes"
 configure_ssh "PubkeyAuthentication"   "yes"
@@ -209,28 +383,34 @@ configure_ssh "ClientAliveCountMax"    "2"
 configure_ssh "X11Forwarding"          "no"
 configure_ssh "AllowTcpForwarding"     "no"
 
-# Проверка синтаксиса
-sshd -t || die "Ошибка синтаксиса sshd_config! Откат..."
+sshd -t || { cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config; die "Ошибка sshd_config — откат выполнен"; }
 systemctl enable ssh
 systemctl restart ssh
+sleep 2
 
-check_ok "SSH слушает порт 3270" "ss -tlnp" ":3270"
-log_ok "SSH настроен. Подключись в НОВОМ терминале: ssh -p 3270 ${NEW_USER}@${SERVER_IP}"
-log_warn "НЕ ЗАКРЫВАЙ текущий сеанс до проверки нового подключения!"
+ss -tlnp | grep -q ":${SSH_PORT}" && log_ok "SSH слушает порт ${SSH_PORT}" || \
+  log_warn "SSH не найден на порту ${SSH_PORT}!"
+
 echo ""
-read -rp "$(echo -e "${BOLD}Открой новый терминал, войди как ${NEW_USER} на порт 3270, потом вернись и нажми Enter:${NC} ")" _
+echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${YELLOW}║  ВАЖНО: ПРОВЕРЬ SSH ДО ЗАКРЫТИЯ ЭТОГО ОКНА!        ║${NC}"
+echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Открой НОВЫЙ терминал и выполни:"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP}${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Если вход не удался — в ЭТОМ терминале:"
+echo -e "${BOLD}${YELLOW}║${NC}  ${RED}cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${RED}systemctl restart ssh${NC}"
+echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════╝${NC}"
+echo ""
+read -rp "$(echo -e "${BOLD}Подтверди успешный вход в новом терминале, затем нажми Enter:${NC} ")" _
 
-# ── 1.3 ICMP (ping) ──────────────────────────────────────────────────────────
+# ── 1.3 ICMP ─────────────────────────────────────────────────────────────────
 log_section "1.3 — Отключение ICMP (ping)"
-
-# Добавляем в /etc/sysctl.conf если не было
-grep -q "net.ipv4.icmp_echo_ignore_all" /etc/sysctl.conf || \
-  echo "net.ipv4.icmp_echo_ignore_all = 1" >> /etc/sysctl.conf
-grep -q "net.ipv6.icmp.echo_ignore_all" /etc/sysctl.conf || \
-  echo "net.ipv6.icmp.echo_ignore_all = 1" >> /etc/sysctl.conf
-sysctl -p
-
-log_ok "ICMP отключён (ping не будет отвечать)"
+grep -q "icmp_echo_ignore_all" /etc/sysctl.conf || \
+  printf '\nnet.ipv4.icmp_echo_ignore_all = 1\nnet.ipv6.icmp.echo_ignore_all = 1\n' >> /etc/sysctl.conf
+sysctl -p > /dev/null
+log_ok "ICMP отключён"
 
 # ── 1.4 Swap ─────────────────────────────────────────────────────────────────
 log_section "1.4 — Swap-файл 1 ГБ"
@@ -247,53 +427,40 @@ else
 fi
 
 grep -q "vm.swappiness=10" /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
-sysctl -p
-check_ok "Swap активен" "free -h" "Swap"
+sysctl -p > /dev/null
+free -h | grep -q "1.0G\|1024M\|Gi" && log_ok "Swap активен" || \
+  { free -h; log_warn "Проверь swap выше"; }
 
-# ── 1.5 Обновление системы ───────────────────────────────────────────────────
-log_section "1.5 — Обновление системы"
-
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -o Dpkg::Options::="--force-confold" -qq
-apt-get autoremove -y -qq
-apt-get install -y curl wget git htop net-tools ufw fail2ban unzip \
-                   python3 openssl unattended-upgrades apt-listchanges -qq
-
-# Автообновления безопасности
-dpkg-reconfigure -plow unattended-upgrades <<< $'\n'
-log_ok "Система обновлена, базовые утилиты установлены"
-
-# ── 1.6 Часовой пояс ─────────────────────────────────────────────────────────
+# ── 1.5 Часовой пояс ─────────────────────────────────────────────────────────
 timedatectl set-timezone Europe/Moscow
-log_ok "Часовой пояс: $(timedatectl | grep 'Time zone')"
+log_ok "Часовой пояс: Europe/Moscow"
 
-# ── 1.7 UFW ──────────────────────────────────────────────────────────────────
-log_section "1.6 — UFW брандмауэр"
+# ── 1.6 UFW ──────────────────────────────────────────────────────────────────
+log_section "1.5 — UFW брандмауэр"
 
-ufw --force reset
+ufw --force reset > /dev/null
 ufw default deny incoming
 ufw default allow outgoing
 
-ufw allow 3270/tcp              comment 'SSH'
-ufw allow 80/tcp                comment 'HTTP → NPM'
-ufw allow 81/tcp                comment 'NPM Admin (временно)'
-ufw allow 443/tcp               comment 'HTTPS → NPM'
-ufw allow "${P_VLESS_REALITY}/tcp"  comment 'VLESS-Reality (3x-ui)'
-ufw allow "${P_VLESS_XHTTP}/tcp"    comment 'VLESS-XHTTP (3x-ui)'
-ufw allow "${P_TROJAN}/tcp"         comment 'Trojan (3x-ui)'
-ufw allow "${P_SS}/tcp"             comment 'Shadowsocks TCP (3x-ui)'
-ufw allow "${P_SS}/udp"             comment 'Shadowsocks UDP (3x-ui)'
-ufw allow "${P_H2}/udp"             comment 'Hysteria2'
-ufw allow "${P_TELEMT}/tcp"         comment 'Telemt MTProxy'
+ufw allow "${SSH_PORT}/tcp"           comment 'SSH'
+ufw allow 80/tcp                      comment 'HTTP → NPM'
+ufw allow 81/tcp                      comment 'NPM Admin (временно)'
+ufw allow 443/tcp                     comment 'HTTPS → NPM'
+ufw allow "${P_VLESS_REALITY}/tcp"    comment 'VLESS-Reality'
+ufw allow "${P_VLESS_XHTTP}/tcp"      comment 'VLESS-XHTTP'
+ufw allow "${P_TROJAN}/tcp"           comment 'Trojan'
+ufw allow "${P_SS}/tcp"               comment 'Shadowsocks TCP'
+ufw allow "${P_SS}/udp"               comment 'Shadowsocks UDP'
+ufw allow "${P_H2}/udp"               comment 'Hysteria2'
+ufw allow "${P_TELEMT}/tcp"           comment 'Telemt MTProxy'
 
-ufw --force enable
-check_ok "UFW активен" "ufw status" "Status: active"
+ufw --force enable > /dev/null
+ufw status | grep -q "Status: active" && log_ok "UFW активен" || log_warn "UFW не активен!"
 
-# ── 1.8 Fail2Ban ─────────────────────────────────────────────────────────────
-log_section "1.7 — Fail2Ban"
+# ── 1.7 Fail2Ban ─────────────────────────────────────────────────────────────
+log_section "1.6 — Fail2Ban"
 
-tee /etc/fail2ban/jail.local > /dev/null << EOF
+cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime  = 5h
 findtime = 2m
@@ -302,41 +469,58 @@ backend  = systemd
 
 [sshd]
 enabled = true
-port    = 3270
+port    = ${SSH_PORT}
 EOF
 
-systemctl enable fail2ban
+systemctl enable fail2ban > /dev/null 2>&1
 systemctl restart fail2ban
 sleep 2
-check_ok "Fail2Ban работает" "fail2ban-client ping" "pong"
-log_ok "ШАГ 1 завершён"
+fail2ban-client ping 2>/dev/null | grep -q "pong" && log_ok "Fail2Ban работает" || \
+  log_warn "Fail2Ban не отвечает — проверь: journalctl -u fail2ban"
+
+# Ждём завершения фонового apt-get upgrade (запущен в этапе 0)
+if [[ -n "${APT_UPGRADE_PID:-}" ]] && kill -0 "$APT_UPGRADE_PID" 2>/dev/null; then
+  log_info "Ожидаем завершения обновления системы..."
+  wait "$APT_UPGRADE_PID" && log_ok "Обновление системы завершено" || \
+    log_warn "Обновление завершилось с ошибками — проверь вручную"
+fi
+apt-get autoremove -y -qq
+
+stage_done 1 "Пользователь, SSH, Swap, UFW, Fail2Ban" \
+  "SSH откат: cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config && systemctl restart ssh
+  UFW откат:  ufw disable
+  Swap откат: swapoff /swapfile && rm /swapfile"
+
+fi  # END STAGE 1
 
 # =============================================================================
-#  ШАГ 2 — DOCKER
+#  ЭТАП 2 — DOCKER
 # =============================================================================
-log_step "ШАГ 2 — Docker + структура папок + сеть"
+if [[ "$START_STAGE" -le 2 ]]; then
 
-# ── 2.1 Установка Docker ─────────────────────────────────────────────────────
+log_step "ЭТАП 2 — Docker + структура папок + сеть proxy-net"
+
+# ── 2.1 Установка ─────────────────────────────────────────────────────────────
 log_section "2.1 — Установка Docker"
 
 if command -v docker &>/dev/null; then
-  log_warn "Docker уже установлен — пропускаю"
+  log_warn "Docker уже установлен: $(docker --version)"
 else
   curl -fsSL https://get.docker.com | sh
   log_ok "Docker установлен"
 fi
 
 usermod -aG docker "$NEW_USER"
-systemctl enable docker
+systemctl enable docker > /dev/null 2>&1
 systemctl start docker
+docker version --format 'Server: {{.Server.Version}}' 2>/dev/null && log_ok "Docker запущен" || \
+  log_warn "Docker не запустился!"
 
-check_ok "Docker запущен" "docker version" "Version"
-
-# ── 2.2 Лимиты логов Docker ──────────────────────────────────────────────────
+# ── 2.2 Лимиты логов ─────────────────────────────────────────────────────────
 log_section "2.2 — Лимиты логов Docker"
 
 mkdir -p /etc/docker
-tee /etc/docker/daemon.json > /dev/null << 'EOF'
+cat > /etc/docker/daemon.json << 'EOF'
 {
   "log-driver": "json-file",
   "log-opts": {
@@ -347,37 +531,50 @@ tee /etc/docker/daemon.json > /dev/null << 'EOF'
 EOF
 
 systemctl restart docker
-check_ok "Docker daemon перезапущен" "docker info" "Logging Driver"
+sleep 2
+log_ok "Лимиты логов: 20m × 3 файла"
 
 # ── 2.3 Структура папок ───────────────────────────────────────────────────────
-log_section "2.3 — Структура папок /opt/docker"
+log_section "2.3 — Структура /opt/docker"
 
 mkdir -p /opt/docker/{nginx-proxy-manager/data,nginx-proxy-manager/letsencrypt,\
 nginx-site/html,3x-ui/db,3x-ui/cert,telemt,hysteria2/cert}
 chown -R "${NEW_USER}:${NEW_USER}" /opt/docker
-log_ok "Папки созданы в /opt/docker/"
+log_ok "Папки созданы"
 
 # ── 2.4 Сеть proxy-net ───────────────────────────────────────────────────────
-log_section "2.4 — Docker-сеть proxy-net"
+log_section "2.4 — Сеть proxy-net"
 
 if docker network ls | grep -q proxy-net; then
-  log_warn "Сеть proxy-net уже существует — пропускаю"
+  log_warn "Сеть proxy-net уже существует"
 else
   docker network create --subnet=172.18.0.0/16 proxy-net
-  log_ok "Сеть proxy-net создана"
+  log_ok "Сеть proxy-net (172.18.0.0/16) создана"
 fi
 
-check_ok "Сеть proxy-net существует" "docker network ls" "proxy-net"
-log_ok "ШАГ 2 завершён"
+stage_done 2 "Docker, папки, proxy-net" \
+  "docker network rm proxy-net
+  apt-get remove -y docker-ce docker-ce-cli containerd.io"
+
+fi  # END STAGE 2
 
 # =============================================================================
-#  ШАГ 3 — NGINX PROXY MANAGER
+#  ЭТАП 3 — NGINX PROXY MANAGER
 # =============================================================================
-log_step "ШАГ 3 — Nginx Proxy Manager"
+if [[ "$START_STAGE" -le 3 ]]; then
 
-log_section "3.1 — docker-compose.yml для NPM"
+log_step "ЭТАП 3 — Nginx Proxy Manager"
 
-tee /opt/docker/nginx-proxy-manager/docker-compose.yml > /dev/null << EOF
+# DNS проверка
+echo ""
+log_info "Проверяем DNS-записи (нужны до получения SSL):"
+wait_dns "${NPM_DOMAIN}"  "${SERVER_IP}"
+wait_dns "${XUI_DOMAIN}"  "${SERVER_IP}"
+wait_dns "${ROOT_DOMAIN}" "${SERVER_IP}"
+wait_dns "${H2_DOMAIN}"   "${SERVER_IP}"
+
+# ── docker-compose.yml ────────────────────────────────────────────────────────
+cat > /opt/docker/nginx-proxy-manager/docker-compose.yml << EOF
 services:
   npm:
     image: jc21/nginx-proxy-manager:latest
@@ -405,63 +602,78 @@ networks:
     external: true
 EOF
 
-log_section "3.2 — Запуск NPM"
-
 cd /opt/docker/nginx-proxy-manager
-docker compose up -d
-log_info "Ждём 20 секунд пока NPM инициализируется..."
-sleep 20
 
-check_ok "NPM запущен" "docker compose ps" "Up"
+if docker ps --format '{{.Names}}' | grep -q nginx-proxy-manager; then
+  log_warn "NPM уже запущен — перезапускаю"
+  docker compose down
+fi
+
+docker compose up -d
+log_info "Ждём инициализации NPM (25 секунд)..."
+sleep 25
+
+docker ps --format '{{.Names}} {{.Status}}' | grep nginx-proxy-manager | \
+  grep -q "Up" && log_ok "NPM запущен" || log_warn "NPM не запустился — смотри: docker logs nginx-proxy-manager"
 
 echo ""
 echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${YELLOW}║  ВАЖНО: РУЧНЫЕ ДЕЙСТВИЯ В NPM                       ║${NC}"
+echo -e "${BOLD}${YELLOW}║  ДЕЙСТВИЯ В БРАУЗЕРЕ — NPM                          ║${NC}"
 echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} 1. Открой в браузере: ${CYAN}http://${SERVER_IP}:81${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} 2. Войди: admin@example.com / changeme"
-echo -e "${BOLD}${YELLOW}║${NC} 3. Смени email на: ${GREEN}${LE_EMAIL}${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} 4. Смени пароль на надёжный"
+echo -e "${BOLD}${YELLOW}║${NC} 1. Открой: ${CYAN}http://${SERVER_IP}:81${NC}"
+echo -e "${BOLD}${YELLOW}║${NC} 2. Войди:  admin@example.com / changeme"
+echo -e "${BOLD}${YELLOW}║${NC} 3. Смени email → ${GREEN}${LE_EMAIL}${NC} и задай новый пароль"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} 5. Добавь Proxy Host для ${CYAN}${NPM_DOMAIN}${NC}:"
-echo -e "${BOLD}${YELLOW}║${NC}    Forward Hostname: nginx-proxy-manager"
-echo -e "${BOLD}${YELLOW}║${NC}    Forward Port:     81"
+echo -e "${BOLD}${YELLOW}║${NC} 4. Add Proxy Host для ${CYAN}${NPM_DOMAIN}${NC}:"
+echo -e "${BOLD}${YELLOW}║${NC}    Forward Hostname: ${GREEN}nginx-proxy-manager${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Forward Port:     ${GREEN}81${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}    SSL: Let's Encrypt + Force SSL + HTTP/2"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} DNS должна быть настроена ДО этого!"
-echo -e "${BOLD}${YELLOW}║${NC} ${ROOT_DOMAIN}     → ${SERVER_IP}"
-echo -e "${BOLD}${YELLOW}║${NC} www.${ROOT_DOMAIN} → ${SERVER_IP}"
-echo -e "${BOLD}${YELLOW}║${NC} ${NPM_DOMAIN}  → ${SERVER_IP}"
-echo -e "${BOLD}${YELLOW}║${NC} ${XUI_DOMAIN}  → ${SERVER_IP}"
-echo -e "${BOLD}${YELLOW}║${NC} ${H2_DOMAIN}   → ${SERVER_IP}"
+echo -e "${BOLD}${YELLOW}║${NC} DNS должна быть настроена:"
+echo -e "${BOLD}${YELLOW}║${NC}   ${ROOT_DOMAIN}     → ${SERVER_IP}"
+echo -e "${BOLD}${YELLOW}║${NC}   www.${ROOT_DOMAIN} → ${SERVER_IP}"
+echo -e "${BOLD}${YELLOW}║${NC}   ${NPM_DOMAIN} → ${SERVER_IP}"
+echo -e "${BOLD}${YELLOW}║${NC}   ${XUI_DOMAIN} → ${SERVER_IP}"
+echo -e "${BOLD}${YELLOW}║${NC}   ${H2_DOMAIN}  → ${SERVER_IP}"
 echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-read -rp "$(echo -e "${BOLD}Выполни всё выше, проверь https://${NPM_DOMAIN} — потом нажми Enter:${NC} ")" _
+read -rp "$(echo -e "${BOLD}Выполни всё выше, убедись что https://${NPM_DOMAIN} открывается → Enter:${NC} ")" _
 
-# Закрываем прямой доступ к порту 81
-log_section "3.3 — Закрываем прямой доступ к порту 81"
-
+# ── Закрываем порт 81 ────────────────────────────────────────────────────────
+log_section "Закрываем порт 81"
 ufw delete allow 81/tcp 2>/dev/null || true
-# Переводим на localhost в compose
 sed -i 's|- "81:81"|- "127.0.0.1:81:81"|' \
   /opt/docker/nginx-proxy-manager/docker-compose.yml
 
 cd /opt/docker/nginx-proxy-manager
 docker compose down && docker compose up -d
-sleep 10
+sleep 15
 
-check_ok "NPM работает через домен" \
-  "curl -s -o /dev/null -w '%{http_code}' https://${NPM_DOMAIN}" "200"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://${NPM_DOMAIN}" 2>/dev/null || echo "000")
+if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
+  log_ok "https://${NPM_DOMAIN} отвечает (HTTP ${HTTP_CODE})"
+else
+  log_warn "https://${NPM_DOMAIN} вернул HTTP ${HTTP_CODE} — проверь настройки NPM"
+fi
 
-log_ok "ШАГ 3 завершён. Панель NPM: https://${NPM_DOMAIN}"
+DIRECT_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://${SERVER_IP}:81" 2>/dev/null || echo "000")
+[[ "$DIRECT_CODE" == "000" ]] && log_ok "Прямой доступ к :81 закрыт ✓" || \
+  log_warn "Порт 81 всё ещё доступен напрямую (HTTP ${DIRECT_CODE})"
+
+stage_done 3 "Nginx Proxy Manager" \
+  "cd /opt/docker/nginx-proxy-manager && docker compose down
+  ufw delete allow 80/tcp && ufw delete allow 443/tcp"
+
+fi  # END STAGE 3
 
 # =============================================================================
-#  ШАГ 4 — NGINX САЙТ-ЗАГЛУШКА
+#  ЭТАП 4 — NGINX САЙТ-ЗАГЛУШКА
 # =============================================================================
-log_step "ШАГ 4 — Nginx сайт-заглушка"
+if [[ "$START_STAGE" -le 4 ]]; then
 
-# ── HTML страница ─────────────────────────────────────────────────────────────
-tee /opt/docker/nginx-site/html/index.html > /dev/null << EOF
+log_step "ЭТАП 4 — Nginx сайт-заглушка"
+
+cat > /opt/docker/nginx-site/html/index.html << EOF
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -502,8 +714,7 @@ tee /opt/docker/nginx-site/html/index.html > /dev/null << EOF
 </html>
 EOF
 
-# ── docker-compose.yml ────────────────────────────────────────────────────────
-tee /opt/docker/nginx-site/docker-compose.yml > /dev/null << 'EOF'
+cat > /opt/docker/nginx-site/docker-compose.yml << 'EOF'
 services:
   nginx-site:
     image: nginx:alpine
@@ -529,32 +740,42 @@ networks:
 EOF
 
 cd /opt/docker/nginx-site
+if docker ps --format '{{.Names}}' | grep -q nginx-site; then
+  docker compose down
+fi
 docker compose up -d
 sleep 5
-check_ok "nginx-site запущен" "docker compose ps" "Up"
+
+docker ps --format '{{.Names}} {{.Status}}' | grep nginx-site | grep -q "Up" && \
+  log_ok "nginx-site запущен" || log_warn "nginx-site не запустился"
 
 echo ""
 echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${YELLOW}║  ВАЖНО: ДОБАВЬ PROXY HOST В NPM ДЛЯ САЙТА          ║${NC}"
+echo -e "${BOLD}${YELLOW}║  ДЕЙСТВИЯ В NPM — САЙТ-ЗАГЛУШКА                    ║${NC}"
 echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} В NPM → Hosts → Proxy Hosts → Add:"
+echo -e "${BOLD}${YELLOW}║${NC} Add Proxy Host:"
 echo -e "${BOLD}${YELLOW}║${NC}   Domain Names:     ${CYAN}${ROOT_DOMAIN}${NC} + ${CYAN}www.${ROOT_DOMAIN}${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}   Forward Hostname: nginx-site"
-echo -e "${BOLD}${YELLOW}║${NC}   Forward Port:     80"
+echo -e "${BOLD}${YELLOW}║${NC}   Forward Hostname: ${GREEN}nginx-site${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}   Forward Port:     ${GREEN}80${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}   Websockets: ✔ | Block Common Exploits: ✔"
 echo -e "${BOLD}${YELLOW}║${NC}   SSL: Let's Encrypt + Force SSL + HTTP/2"
 echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-read -rp "$(echo -e "${BOLD}Настрой Proxy Host, проверь https://${ROOT_DOMAIN} — нажми Enter:${NC} ")" _
+read -rp "$(echo -e "${BOLD}Настрой Proxy Host, проверь https://${ROOT_DOMAIN} → Enter:${NC} ")" _
 
-log_ok "ШАГ 4 завершён. Сайт: https://${ROOT_DOMAIN}"
+stage_done 4 "Nginx сайт-заглушка" \
+  "cd /opt/docker/nginx-site && docker compose down"
+
+fi  # END STAGE 4
 
 # =============================================================================
-#  ШАГ 5 — 3x-ui (VLESS-Reality, VLESS-XHTTP, Trojan, Shadowsocks)
+#  ЭТАП 5 — 3x-ui
 # =============================================================================
-log_step "ШАГ 5 — 3x-ui (панель управления VPN)"
+if [[ "$START_STAGE" -le 5 ]]; then
 
-# ── docker-compose.yml ────────────────────────────────────────────────────────
-tee /opt/docker/3x-ui/docker-compose.yml > /dev/null << EOF
+log_step "ЭТАП 5 — 3x-ui (панель управления VPN)"
+
+cat > /opt/docker/3x-ui/docker-compose.yml << EOF
 services:
   3x-ui:
     image: ghcr.io/mhsanaei/3x-ui:latest
@@ -569,7 +790,7 @@ services:
       - "${P_SS}:${P_SS}"
       - "${P_SS}:${P_SS}/udp"
     expose:
-      - "2053"
+      - "${XUI_PORT}"
     volumes:
       - /opt/docker/3x-ui/db:/etc/x-ui
       - /opt/docker/3x-ui/cert:/root/cert
@@ -588,127 +809,220 @@ networks:
     external: true
 EOF
 
-# ── Запуск ────────────────────────────────────────────────────────────────────
 cd /opt/docker/3x-ui
+if docker ps --format '{{.Names}}' | grep -q "^3x-ui$"; then
+  docker compose down
+fi
+
 docker compose pull
 docker compose up -d
-log_info "Ждём 15 секунд..."
-sleep 15
+log_info "Ждём 20 секунд..."
+sleep 20
 
-check_ok "3x-ui запущен" "docker compose ps" "Up"
+docker ps --format '{{.Names}} {{.Status}}' | grep "3x-ui" | grep -q "Up" && \
+  log_ok "3x-ui запущен" || log_warn "3x-ui не запустился — см. docker logs 3x-ui"
 
-# ── Смена пароля через API ────────────────────────────────────────────────────
-log_section "5.1 — Смена учётных данных 3x-ui"
-log_info "Меняем логин/пароль через CLI внутри контейнера..."
+# ── Смена пароля через SQLite ─────────────────────────────────────────────────
+log_section "5.1 — Смена пароля 3x-ui через SQLite"
 
-docker exec 3x-ui x-ui setting -username "${NEW_USER}" -password "${XUI_PASS}" || \
-  log_warn "Не удалось сменить пароль автоматически — сделай вручную в панели"
+log_info "Метод: прямая запись в БД SQLite (работает в версиях 3.x)"
+log_info "Файл БД: /opt/docker/3x-ui/db/x-ui.db"
 
-docker restart 3x-ui
-sleep 10
+# Хэшируем пароль так же как это делает 3x-ui (MD5 для совместимости)
+# 3x-ui >= 2.3 хранит пароли в открытом виде в таблице settings
+XUI_PASS_ESCAPED=$(printf '%s' "$XUI_PASS" | sed "s/'/''/g")
+NEW_USER_ESCAPED=$(printf '%s' "$NEW_USER" | sed "s/'/''/g")
+
+# Ждём появления БД (она создаётся при первом запуске)
+DB_PATH="/opt/docker/3x-ui/db/x-ui.db"
+for i in $(seq 1 10); do
+  [[ -f "$DB_PATH" ]] && break
+  log_info "Ждём создания БД (${i}/10)..."
+  sleep 3
+done
+
+if [[ -f "$DB_PATH" ]]; then
+  # Устанавливаем sqlite3 если нет
+  command -v sqlite3 &>/dev/null || apt-get install -y -qq sqlite3
+
+  # Проверяем структуру таблицы
+  TABLES=$(sqlite3 "$DB_PATH" ".tables" 2>/dev/null || echo "")
+  log_info "Таблицы в БД: ${TABLES}"
+
+  if echo "$TABLES" | grep -q "settings"; then
+    # Меняем через таблицу settings
+    sqlite3 "$DB_PATH" "UPDATE settings SET value='${NEW_USER_ESCAPED}' WHERE key='webUsername';" 2>/dev/null || true
+    sqlite3 "$DB_PATH" "UPDATE settings SET value='${XUI_PASS_ESCAPED}' WHERE key='webPassword';" 2>/dev/null || true
+
+    # Проверяем результат
+    SAVED_USER=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='webUsername';" 2>/dev/null || echo "?")
+    log_info "Сохранённый логин в БД: ${SAVED_USER}"
+
+    if [[ "$SAVED_USER" == "$NEW_USER" ]]; then
+      log_ok "Логин/пароль записаны в БД"
+      docker restart 3x-ui
+      sleep 15
+      log_ok "3x-ui перезапущен с новыми учётными данными"
+    else
+      log_warn "Таблица settings не содержит webUsername — попробуем users"
+    fi
+  fi
+
+  if echo "$TABLES" | grep -q "users"; then
+    sqlite3 "$DB_PATH" "UPDATE users SET username='${NEW_USER_ESCAPED}', password='${XUI_PASS_ESCAPED}' WHERE id=1;" 2>/dev/null || true
+    docker restart 3x-ui
+    sleep 15
+    log_ok "Логин/пароль обновлены через таблицу users"
+  fi
+else
+  log_warn "БД не найдена по пути ${DB_PATH}"
+fi
+
+# ── Инструкция ручной смены ───────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${YELLOW}║  КАК ВРУЧНУЮ ПОМЕНЯТЬ ЛОГИН/ПАРОЛЬ 3x-ui (v3.x)           ║${NC}"
+echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Способ 1 — через панель (если вошёл как admin/admin):"
+echo -e "${BOLD}${YELLOW}║${NC}  Settings → Panel Settings → Username / Password → Save"
+echo -e "${BOLD}${YELLOW}║${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Способ 2 — через SQLite напрямую:"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}docker stop 3x-ui${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}apt-get install -y sqlite3${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}sqlite3 /opt/docker/3x-ui/db/x-ui.db${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Внутри sqlite3 — посмотреть таблицы:"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}.tables${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Посмотреть текущие настройки:"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}SELECT * FROM settings WHERE key LIKE '%web%';${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Изменить логин и пароль:"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}UPDATE settings SET value='ВАШ_ЛОГИН' WHERE key='webUsername';${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}UPDATE settings SET value='ВАШ_ПАРОЛЬ' WHERE key='webPassword';${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}.quit${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}docker start 3x-ui${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Способ 3 — если таблица users:"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}UPDATE users SET username='ВАШ_ЛОГИН', password='ВАШ_ПАРОЛЬ' WHERE id=1;${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Проверить какие таблицы есть:"
+echo -e "${BOLD}${YELLOW}║${NC}  ${CYAN}sqlite3 /opt/docker/3x-ui/db/x-ui.db '.tables'${NC}"
+echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
 
 # ── Proxy Host в NPM ─────────────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${YELLOW}║  ВАЖНО: ДОБАВЬ PROXY HOST В NPM ДЛЯ 3x-ui          ║${NC}"
-echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} В NPM → Hosts → Proxy Hosts → Add:"
-echo -e "${BOLD}${YELLOW}║${NC}   Domain Names:     ${CYAN}${XUI_DOMAIN}${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}   Forward Hostname: 3x-ui"
-echo -e "${BOLD}${YELLOW}║${NC}   Forward Port:     2053"
-echo -e "${BOLD}${YELLOW}║${NC}   Websockets: ✔"
-echo -e "${BOLD}${YELLOW}║${NC}   SSL: Let's Encrypt + Force SSL + HTTP/2"
-echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${YELLOW}║  ВОЙДИ В ПАНЕЛЬ 3x-ui и НАСТРОЙ INBOUNDS:          ║${NC}"
-echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} URL: ${CYAN}https://${XUI_DOMAIN}${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} Логин:  ${GREEN}${NEW_USER}${NC}"
-echo -e "${BOLD}${YELLOW}║${NC} Пароль: ${GREEN}${XUI_PASS}${NC}"
+echo -e "${BOLD}${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${YELLOW}║  ДЕЙСТВИЯ В NPM — 3x-ui + НАСТРОЙКА INBOUNDS               ║${NC}"
+echo -e "${BOLD}${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Add Proxy Host:"
+echo -e "${BOLD}${YELLOW}║${NC}    Domain Names:     ${CYAN}${XUI_DOMAIN}${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Forward Hostname: ${GREEN}3x-ui${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Forward Port:     ${GREEN}${XUI_PORT}${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Websockets: ✔ | Block Common Exploits: ✔"
+echo -e "${BOLD}${YELLOW}║${NC}    SSL: Let's Encrypt + Force SSL + HTTP/2"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║  VLESS-Reality (порт ${P_VLESS_REALITY}):${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}   Protocol: vless | Network: tcp"
-echo -e "${BOLD}${YELLOW}║${NC}   Security: reality"
-echo -e "${BOLD}${YELLOW}║${NC}   uTLS: chrome | Dest: www.apple.com:443"
-echo -e "${BOLD}${YELLOW}║${NC}   Server Names: www.apple.com"
-echo -e "${BOLD}${YELLOW}║${NC}   Flow: xtls-rprx-vision"
+echo -e "${BOLD}${YELLOW}║${NC}  Панель: ${CYAN}https://${XUI_DOMAIN}${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  Логин:  ${GREEN}${NEW_USER}${NC}   Пароль: ${GREEN}${XUI_PASS}${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  (если не вошёл — используй способ 2 выше)"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║  VLESS-XHTTP (порт ${P_VLESS_XHTTP}):${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}   Protocol: vless | Network: xhttp"
-echo -e "${BOLD}${YELLOW}║${NC}   Security: tls (self-signed ok)"
-echo -e "${BOLD}${YELLOW}║${NC}   Path: /xhttp"
+echo -e "${BOLD}${YELLOW}║  INBOUNDS (Inbounds → Add Inbound):                         ║${NC}"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║  Trojan (порт ${P_TROJAN}):${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}   Protocol: trojan | Network: tcp"
-echo -e "${BOLD}${YELLOW}║${NC}   Security: tls"
+echo -e "${BOLD}${YELLOW}║${NC}  ${BOLD}VLESS-Reality (порт ${P_VLESS_REALITY}):${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Protocol: vless | Network: tcp | Security: reality"
+echo -e "${BOLD}${YELLOW}║${NC}    uTLS: chrome | Dest: www.apple.com:443"
+echo -e "${BOLD}${YELLOW}║${NC}    Server Names: www.apple.com"
+echo -e "${BOLD}${YELLOW}║${NC}    Flow: xtls-rprx-vision"
+echo -e "${BOLD}${YELLOW}║${NC}    (ключи Reality генерирует кнопкой ↻ сам)"
 echo -e "${BOLD}${YELLOW}║${NC}"
-echo -e "${BOLD}${YELLOW}║  Shadowsocks (порт ${P_SS}):${NC}"
-echo -e "${BOLD}${YELLOW}║${NC}   Protocol: shadowsocks"
-echo -e "${BOLD}${YELLOW}║${NC}   Method: chacha20-ietf-poly1305"
-echo -e "${BOLD}${YELLOW}║${NC}   Network: tcp,udp"
-echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${BOLD}VLESS-XHTTP (порт ${P_VLESS_XHTTP}):${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Protocol: vless | Network: xhttp"
+echo -e "${BOLD}${YELLOW}║${NC}    Security: tls | Path: /xhttp"
+echo -e "${BOLD}${YELLOW}║${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${BOLD}Trojan (порт ${P_TROJAN}):${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Protocol: trojan | Network: tcp | Security: tls"
+echo -e "${BOLD}${YELLOW}║${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}  ${BOLD}Shadowsocks (порт ${P_SS}):${NC}"
+echo -e "${BOLD}${YELLOW}║${NC}    Protocol: shadowsocks"
+echo -e "${BOLD}${YELLOW}║${NC}    Method: chacha20-ietf-poly1305 | Network: tcp,udp"
+echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-read -rp "$(echo -e "${BOLD}Настрой всё выше, проверь https://${XUI_DOMAIN} — нажми Enter:${NC} ")" _
+read -rp "$(echo -e "${BOLD}Настрой NPM + Inbounds, проверь https://${XUI_DOMAIN} → Enter:${NC} ")" _
 
-log_ok "ШАГ 5 завершён. 3x-ui: https://${XUI_DOMAIN}"
+stage_done 5 "3x-ui" \
+  "cd /opt/docker/3x-ui && docker compose down
+  (данные сохранены в /opt/docker/3x-ui/db/)"
+
+fi  # END STAGE 5
 
 # =============================================================================
-#  ШАГ 6 — HYSTERIA 2
+#  ЭТАП 6 — HYSTERIA 2
 # =============================================================================
-log_step "ШАГ 6 — Hysteria 2 (QUIC/UDP)"
+if [[ "$START_STAGE" -le 6 ]]; then
 
-# ── Установка acme.sh ─────────────────────────────────────────────────────────
-log_section "6.1 — Установка acme.sh"
+log_step "ЭТАП 6 — Hysteria 2 (QUIC/UDP)"
 
 HOME_DIR=$(getent passwd "$NEW_USER" | cut -d: -f6)
 ACME="${HOME_DIR}/.acme.sh/acme.sh"
+CERT_DIR="/opt/docker/hysteria2/cert"
+
+# ── DNS проверка ──────────────────────────────────────────────────────────────
+wait_dns "${H2_DOMAIN}" "${SERVER_IP}"
+
+# ── Установка acme.sh ─────────────────────────────────────────────────────────
+log_section "6.1 — acme.sh"
 
 if [[ -f "$ACME" ]]; then
-  log_warn "acme.sh уже установлен — пропускаю"
+  log_warn "acme.sh уже установлен"
 else
-  su - "$NEW_USER" -c \
-    "curl https://get.acme.sh | sh -s email=${LE_EMAIL}"
+  su - "$NEW_USER" -c "curl https://get.acme.sh | sh -s email=${LE_EMAIL}"
   log_ok "acme.sh установлен"
 fi
 
-check_ok "acme.sh доступен" "su - ${NEW_USER} -c '${ACME} --version'" "acme"
-
-# ── Выпуск сертификата ────────────────────────────────────────────────────────
-log_section "6.2 — Выпуск TLS-сертификата для ${H2_DOMAIN}"
-
-CERT_DIR="/opt/docker/hysteria2/cert"
 chown -R "${NEW_USER}:${NEW_USER}" "${CERT_DIR}"
 
-log_info "Пытаемся получить сертификат через webroot (NPM должен быть запущен)..."
+# ── Сертификат ───────────────────────────────────────────────────────────────
+log_section "6.2 — TLS-сертификат для ${H2_DOMAIN}"
 
 ACME_WEBROOT="/opt/docker/nginx-proxy-manager/data/letsencrypt-acme-challenge"
 mkdir -p "$ACME_WEBROOT"
+chown -R "${NEW_USER}:${NEW_USER}" "$ACME_WEBROOT"
 
-# Сначала пробуем webroot через NPM
-if su - "$NEW_USER" -c "
-  ${ACME} --issue \
-    -d ${H2_DOMAIN} \
-    --webroot ${ACME_WEBROOT} \
-    --server letsencrypt \
-    --force 2>&1
-" ; then
-  log_ok "Сертификат получен через webroot"
-else
-  log_warn "Webroot не сработал — пробуем standalone (NPM остановим на 60 секунд)"
-  cd /opt/docker/nginx-proxy-manager && docker compose stop
-  sleep 5
+CERT_OBTAINED=false
 
-  su - "$NEW_USER" -c "
-    ${ACME} --issue \
-      -d ${H2_DOMAIN} \
-      --standalone \
-      --server letsencrypt \
-      --httpport 80 \
-      --force 2>&1
-  " || die "Не удалось получить сертификат. Убедись что DNS ${H2_DOMAIN} → ${SERVER_IP}"
-
-  cd /opt/docker/nginx-proxy-manager && docker compose up -d
-  sleep 10
+# Проверяем — может сертификат уже есть
+if [[ -f "${CERT_DIR}/fullchain.pem" ]]; then
+  EXPIRY=$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+  log_warn "Сертификат уже существует (истекает: ${EXPIRY}) — пропускаю получение"
+  CERT_OBTAINED=true
 fi
+
+if [[ "$CERT_OBTAINED" == "false" ]]; then
+  log_info "Пробуем webroot через NPM..."
+  if su - "$NEW_USER" -c "
+    ${ACME} --issue -d ${H2_DOMAIN} \
+      --webroot ${ACME_WEBROOT} \
+      --server letsencrypt --force 2>&1
+  "; then
+    log_ok "Сертификат получен через webroot"
+    CERT_OBTAINED=true
+  else
+    log_warn "Webroot не сработал — пробуем standalone (NPM остановим на ~60 сек)"
+    cd /opt/docker/nginx-proxy-manager && docker compose stop
+    sleep 3
+
+    if su - "$NEW_USER" -c "
+      ${ACME} --issue -d ${H2_DOMAIN} \
+        --standalone --httpport 80 \
+        --server letsencrypt --force 2>&1
+    "; then
+      log_ok "Сертификат получен через standalone"
+      CERT_OBTAINED=true
+    fi
+
+    cd /opt/docker/nginx-proxy-manager && docker compose up -d
+    sleep 10
+  fi
+fi
+
+[[ "$CERT_OBTAINED" == "true" ]] || die "Не удалось получить сертификат для ${H2_DOMAIN}. Убедись что DNS настроен и порт 80 открыт."
 
 # ── Установка сертификата ─────────────────────────────────────────────────────
 su - "$NEW_USER" -c "
@@ -717,14 +1031,14 @@ su - "$NEW_USER" -c "
     --key-file      ${CERT_DIR}/key.pem \
     --fullchain-file ${CERT_DIR}/fullchain.pem \
     --reloadcmd 'docker restart hysteria2 2>/dev/null || true'
-"
+" && log_ok "Сертификат установлен в ${CERT_DIR}/"
 
-check_ok "Сертификат установлен" "ls ${CERT_DIR}" "fullchain.pem"
+[[ -f "${CERT_DIR}/fullchain.pem" ]] || die "Файл сертификата не найден!"
 
-# ── Конфиг Hysteria2 ─────────────────────────────────────────────────────────
+# ── Конфиг ───────────────────────────────────────────────────────────────────
 log_section "6.3 — Конфиг Hysteria 2"
 
-tee /opt/docker/hysteria2/config.yaml > /dev/null << EOF
+cat > /opt/docker/hysteria2/config.yaml << EOF
 listen: :${P_H2}
 
 tls:
@@ -746,8 +1060,7 @@ bandwidth:
   down: 100 mbps
 EOF
 
-# ── docker-compose.yml ────────────────────────────────────────────────────────
-tee /opt/docker/hysteria2/docker-compose.yml > /dev/null << EOF
+cat > /opt/docker/hysteria2/docker-compose.yml << EOF
 services:
   hysteria2:
     image: tobyxdd/hysteria:latest
@@ -775,19 +1088,31 @@ networks:
 EOF
 
 cd /opt/docker/hysteria2
+if docker ps --format '{{.Names}}' | grep -q hysteria2; then
+  docker compose down
+fi
 docker compose up -d
 sleep 10
-check_ok "Hysteria2 запущен" "docker compose ps" "Up"
-check_ok "UDP порт ${P_H2} слушает" "ss -ulnp" "${P_H2}"
 
-log_ok "ШАГ 6 завершён. Hysteria2 запущен на UDP ${P_H2}"
+docker ps --format '{{.Names}} {{.Status}}' | grep hysteria2 | grep -q "Up" && \
+  log_ok "Hysteria2 запущен" || log_warn "Hysteria2 не запустился — см. docker logs hysteria2"
+ss -ulnp | grep -q "${P_H2}" && log_ok "UDP ${P_H2} слушает" || \
+  log_warn "UDP ${P_H2} не найден в ss — проверь: docker logs hysteria2"
+
+stage_done 6 "Hysteria 2" \
+  "cd /opt/docker/hysteria2 && docker compose down
+  ufw delete allow ${P_H2}/udp"
+
+fi  # END STAGE 6
 
 # =============================================================================
-#  ШАГ 7 — TELEMT MTProxy
+#  ЭТАП 7 — TELEMT MTProxy
 # =============================================================================
-log_step "ШАГ 7 — Telemt (MTProxy для Telegram)"
+if [[ "$START_STAGE" -le 7 ]]; then
 
-tee /opt/docker/telemt/config.toml > /dev/null << EOF
+log_step "ЭТАП 7 — Telemt MTProxy (Telegram)"
+
+cat > /opt/docker/telemt/config.toml << EOF
 [general]
 use_middle_proxy = true
 
@@ -809,7 +1134,7 @@ tls_domain = "www.apple.com"
 main = "${TELEMT_SECRET}"
 EOF
 
-tee /opt/docker/telemt/docker-compose.yml > /dev/null << EOF
+cat > /opt/docker/telemt/docker-compose.yml << EOF
 services:
   telemt:
     image: ghcr.io/telemt/telemt:latest
@@ -851,71 +1176,78 @@ networks:
 EOF
 
 cd /opt/docker/telemt
+if docker ps --format '{{.Names}}' | grep -q telemt; then
+  docker compose down
+fi
 docker compose pull
 docker compose up -d
 sleep 10
-check_ok "Telemt запущен" "docker compose ps" "Up"
+
+docker ps --format '{{.Names}} {{.Status}}' | grep telemt | grep -q "Up" && \
+  log_ok "Telemt запущен" || log_warn "Telemt не запустился — см. docker logs telemt"
+
+TELEMT_LINK=$(docker logs telemt 2>&1 | grep -i "tg://" | head -1 || echo "см. docker logs telemt")
+
+stage_done 7 "Telemt MTProxy" \
+  "cd /opt/docker/telemt && docker compose down
+  ufw delete allow ${P_TELEMT}/tcp"
+
+fi  # END STAGE 7
 
 # =============================================================================
 #  ИТОГОВАЯ СВОДКА
 # =============================================================================
 log_step "УСТАНОВКА ЗАВЕРШЕНА"
 
-# Получаем ссылки Telemt из логов
-TELEMT_LINK=$(docker logs telemt 2>&1 | grep -i "tg://" | head -1 || echo "см. docker logs telemt")
+TELEMT_LINK=$(docker logs telemt 2>&1 | grep -i "tg://" | head -1 2>/dev/null || echo "docker logs telemt | grep tg://")
 
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}${GREEN}║                   ИТОГ УСТАНОВКИ                           ║${NC}"
 echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${GREEN}║  SSH                                                        ║${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Подключение:  ${CYAN}ssh -p 3270 ${NEW_USER}@${SERVER_IP}${NC}"
-echo -e "${BOLD}${GREEN}║                                                             ║${NC}"
-echo -e "${BOLD}${GREEN}║  ПАНЕЛИ УПРАВЛЕНИЯ                                          ║${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  NPM:          ${CYAN}https://${NPM_DOMAIN}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  3x-ui:        ${CYAN}https://${XUI_DOMAIN}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  3x-ui логин:  ${YELLOW}${NEW_USER}${NC} / ${YELLOW}${XUI_PASS}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Сайт:         ${CYAN}https://${ROOT_DOMAIN}${NC}"
-echo -e "${BOLD}${GREEN}║                                                             ║${NC}"
-echo -e "${BOLD}${GREEN}║  VPN-ПРОТОКОЛЫ (настрой Inbounds в 3x-ui)                 ║${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  VLESS-Reality: ${YELLOW}${SERVER_IP}:${P_VLESS_REALITY}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  VLESS-XHTTP:   ${YELLOW}${SERVER_IP}:${P_VLESS_XHTTP}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Trojan:         ${YELLOW}${SERVER_IP}:${P_TROJAN}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Shadowsocks:    ${YELLOW}${SERVER_IP}:${P_SS}${NC}"
-echo -e "${BOLD}${GREEN}║                                                             ║${NC}"
-echo -e "${BOLD}${GREEN}║  HYSTERIA 2                                                 ║${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Домен/порт:   ${YELLOW}${H2_DOMAIN}:${P_H2}${NC} (UDP)"
-echo -e "${BOLD}${GREEN}║${NC}  Пароль:       ${YELLOW}${H2_PASS}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  URI:          ${CYAN}hysteria2://${H2_PASS}@${H2_DOMAIN}:${P_H2}?sni=${H2_DOMAIN}#H2${NC}"
-echo -e "${BOLD}${GREEN}║                                                             ║${NC}"
-echo -e "${BOLD}${GREEN}║  TELEGRAM MTPROXY                                           ║${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Секрет:       ${YELLOW}${TELEMT_SECRET}${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  Ссылка:       ${CYAN}${TELEMT_LINK}${NC}"
+echo -e "${BOLD}${GREEN}║  SSH${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  ${CYAN}ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}"
+echo -e "${BOLD}${GREEN}║  ПАНЕЛИ${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  NPM:   ${CYAN}https://${NPM_DOMAIN}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  3x-ui: ${CYAN}https://${XUI_DOMAIN}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  Логин: ${YELLOW}${NEW_USER}${NC}  Пароль: ${YELLOW}${XUI_PASS}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  Сайт:  ${CYAN}https://${ROOT_DOMAIN}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}"
+echo -e "${BOLD}${GREEN}║  VPN${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  VLESS-Reality : ${YELLOW}${SERVER_IP}:${P_VLESS_REALITY}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  VLESS-XHTTP   : ${YELLOW}${SERVER_IP}:${P_VLESS_XHTTP}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  Trojan        : ${YELLOW}${SERVER_IP}:${P_TROJAN}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  Shadowsocks   : ${YELLOW}${SERVER_IP}:${P_SS}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}"
+echo -e "${BOLD}${GREEN}║  HYSTERIA 2${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  ${YELLOW}${H2_DOMAIN}:${P_H2}${NC} (UDP)"
+echo -e "${BOLD}${GREEN}║${NC}  Пароль: ${YELLOW}${H2_PASS}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  URI: ${CYAN}hysteria2://${H2_PASS}@${H2_DOMAIN}:${P_H2}?sni=${H2_DOMAIN}#H2${NC}"
+echo -e "${BOLD}${GREEN}║${NC}"
+echo -e "${BOLD}${GREEN}║  TELEGRAM MTProxy${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  Секрет: ${YELLOW}${TELEMT_SECRET}${NC}"
+echo -e "${BOLD}${GREEN}║${NC}  ${CYAN}${TELEMT_LINK}${NC}"
 echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${BOLD}${GREEN}║  ОТКРЫТЫЕ ПОРТЫ                                             ║${NC}"
-echo -e "${BOLD}${GREEN}║${NC}  3270/tcp  — SSH"
-echo -e "${BOLD}${GREEN}║${NC}  80/tcp    — HTTP (NPM)"
-echo -e "${BOLD}${GREEN}║${NC}  443/tcp   — HTTPS (NPM)"
-echo -e "${BOLD}${GREEN}║${NC}  ${P_VLESS_REALITY}/tcp  — VLESS-Reality"
-echo -e "${BOLD}${GREEN}║${NC}  ${P_VLESS_XHTTP}/tcp  — VLESS-XHTTP"
-echo -e "${BOLD}${GREEN}║${NC}  ${P_TROJAN}/tcp  — Trojan"
-echo -e "${BOLD}${GREEN}║${NC}  ${P_SS}/tcp+udp — Shadowsocks"
-echo -e "${BOLD}${GREEN}║${NC}  ${P_H2}/udp  — Hysteria2"
-echo -e "${BOLD}${GREEN}║${NC}  ${P_TELEMT}/tcp  — Telemt MTProxy"
+echo -e "${BOLD}${GREEN}║  КОНТЕЙНЕРЫ${NC}"
+docker ps --format "  {{.Names}}: {{.Status}}" 2>/dev/null || true
+echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BOLD}${GREEN}║  ПАМЯТЬ${NC}"
+docker stats --no-stream --format "  {{.Name}}: {{.MemUsage}}" 2>/dev/null || true
 echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
-# Сохраняем итог в файл
+# ── Сохраняем в файл ─────────────────────────────────────────────────────────
 SUMMARY_FILE="/root/vps-setup-summary.txt"
 {
-  echo "=== VPS SETUP SUMMARY ==="
-  echo "Date: $(date)"
+  echo "=== VPS SETUP SUMMARY — $(date) ==="
   echo ""
-  echo "SSH: ssh -p 3270 ${NEW_USER}@${SERVER_IP}"
+  echo "SSH:    ssh -p ${SSH_PORT} ${NEW_USER}@${SERVER_IP}"
   echo ""
   echo "--- Panels ---"
-  echo "NPM:   https://${NPM_DOMAIN}"
-  echo "3x-ui: https://${XUI_DOMAIN}  login: ${NEW_USER} / ${XUI_PASS}"
-  echo "Site:  https://${ROOT_DOMAIN}"
+  echo "NPM:          https://${NPM_DOMAIN}"
+  echo "3x-ui:        https://${XUI_DOMAIN}"
+  echo "3x-ui login:  ${NEW_USER} / ${XUI_PASS}"
+  echo "Site:         https://${ROOT_DOMAIN}"
   echo ""
   echo "--- VPN Ports ---"
   echo "VLESS-Reality: ${SERVER_IP}:${P_VLESS_REALITY}"
@@ -924,31 +1256,26 @@ SUMMARY_FILE="/root/vps-setup-summary.txt"
   echo "Shadowsocks:   ${SERVER_IP}:${P_SS}"
   echo ""
   echo "--- Hysteria2 ---"
-  echo "Server: ${H2_DOMAIN}:${P_H2} (UDP)"
-  echo "Pass:   ${H2_PASS}"
-  echo "URI:    hysteria2://${H2_PASS}@${H2_DOMAIN}:${P_H2}?sni=${H2_DOMAIN}#H2"
+  echo "Server:  ${H2_DOMAIN}:${P_H2} (UDP)"
+  echo "Pass:    ${H2_PASS}"
+  echo "URI:     hysteria2://${H2_PASS}@${H2_DOMAIN}:${P_H2}?sni=${H2_DOMAIN}#H2"
   echo ""
   echo "--- Telemt ---"
-  echo "Secret: ${TELEMT_SECRET}"
-  echo "Link:   ${TELEMT_LINK}"
+  echo "Secret:  ${TELEMT_SECRET}"
+  echo "Link:    ${TELEMT_LINK}"
+  echo ""
+  echo "--- SQLite 3x-ui (если нужно поменять пароль вручную) ---"
+  echo "sqlite3 /opt/docker/3x-ui/db/x-ui.db"
+  echo "UPDATE settings SET value='ВАШ_ЛОГИН' WHERE key='webUsername';"
+  echo "UPDATE settings SET value='ВАШ_ПАРОЛЬ' WHERE key='webPassword';"
+  echo ".quit && docker restart 3x-ui"
 } > "$SUMMARY_FILE"
-
 chmod 600 "$SUMMARY_FILE"
+
+save_state "done"
+
+echo ""
 log_ok "Сводка сохранена в ${SUMMARY_FILE}"
-
-echo ""
-log_info "Проверка всех контейнеров:"
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-
-echo ""
-log_info "Использование памяти:"
-docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"
-
-echo ""
-log_info "UFW статус:"
-ufw status verbose
-
-echo ""
-echo -e "${BOLD}${GREEN}Установка завершена! Все данные сохранены в ${SUMMARY_FILE}${NC}"
-echo -e "${BOLD}${YELLOW}ВАЖНО: Удали этот файл после сохранения данных в менеджер паролей!${NC}"
-echo -e "${BOLD}${YELLOW}       rm ${SUMMARY_FILE}${NC}"
+log_warn "Удали файл после сохранения данных в менеджер паролей:"
+echo -e "  ${RED}rm ${SUMMARY_FILE}${NC}"
+echo -e "  ${RED}rm /root/.vps-setup-vars${NC}"
